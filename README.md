@@ -35,39 +35,36 @@ optional illustration from an external image API.
 
 ## Quick start
 
-**Prerequisites:** Python 3.10+ and [Ollama](https://ollama.com/download) (it serves Qwen locally). No Docker.
+**Prerequisite:** Python 3.10+. That's all: no Docker, and nothing else to install by hand.
 
 ```bash
 git clone <your-repo-url> arxiv-rag && cd arxiv-rag
-python3 -m venv .venv && source .venv/bin/activate     # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
-python main.py                                          # → http://127.0.0.1:8080
+python3 main.py            # Windows: py main.py      → http://127.0.0.1:8080
 ```
 
-That's all. On the first start the app:
+On the first run, `main.py` creates a virtual environment in `.venv` and installs `requirements.txt` into it (never
+into your system Python), then relaunches itself inside it. You can also do this step yourself:
+`python3 -m venv .venv && .venv/bin/pip install -r requirements.txt`. Then the app sets up everything else
+**inside the project's `storage/` folder**, and the browser shows live progress:
 
-1. waits for Ollama (the page tells you if it isn't running),
-2. **downloads the models automatically**: `qwen3.5:4b` (3.3 GB) and `nomic-embed-text` (274 MB) through Ollama,
-   plus the 90 MB reranker from Hugging Face,
-3. streams `data/arxiv_2.9k.jsonl` into the local index (~1.5 min on an Apple M1 Pro; reused on later starts),
-4. serves the UI at **http://127.0.0.1:8080** and the API docs at **/docs**.
+1. **Ollama.** If an Ollama server is already running on this computer, the app uses it. Otherwise it downloads its
+   own copy of Ollama into `storage/runtime/` (macOS 146 MB; Linux/Windows ~1.4 GB including GPU libraries) and
+   runs it as a child process that stops when the app stops.
+2. **Models:** `qwen3.5:4b` (3.3 GB) and `nomic-embed-text` (274 MB) are pulled through Ollama. Models that a
+   regular Ollama installation already has are reused, not downloaded again.
+3. **Index:** `data/arxiv_2.9k.jsonl` is streamed into the local index (~1.5 min on an Apple M1 Pro; reused on
+   later starts).
+4. **In the background, without delaying the app:**
+   - the 90 MB reranker from Hugging Face (answers work meanwhile; reranking turns on when it's ready);
+   - on Macs with 16 GB or more, local FLUX.2 image generation (see
+     [Local images on macOS](#local-images-on-macos-flux2-klein)).
 
-The browser shows live progress for each of these steps.
+The UI is at **http://127.0.0.1:8080** and the API docs at **/docs**. Later starts take a few seconds.
 
-**Prefer a single command?** The setup scripts create the venv, install the requirements, install/start Ollama if
-needed and download every model up front:
-
-```bash
-./scripts/setup.sh                                         # macOS / Linux
-powershell -ExecutionPolicy Bypass -File scripts\setup.ps1   # Windows
-```
-
-You can also pre-download the models on their own with `python -m rag_app.setup_models`
-(for example `--llm qwen3.5:9b`).
-
-> **Why aren't the models in `requirements.txt`?** pip can only install Python packages. Model weights are
-> downloaded by the `ollama` client (listed in `requirements.txt`) the first time the app starts, so
-> `pip install -r requirements.txt` + `python main.py` is the whole minimal installation.
+> **Why isn't everything in `requirements.txt`?** pip can only install Python packages. The Python packages
+> come from `requirements.txt`; Ollama and the model weights are downloaded by the app itself, so
+> `python3 main.py` is the whole installation. To download everything up front instead, run
+> `.venv/bin/python -m rag_app.setup_models` (for example `--llm qwen3.5:9b`).
 
 ---
 
@@ -78,23 +75,23 @@ seconds (no re-indexing, no re-downloading). Run the commands from the project f
 
 | Action | macOS / Linux | Windows (PowerShell) |
 |---|---|---|
-| Start | `source .venv/bin/activate && python main.py` | `.venv\Scripts\python.exe main.py` |
+| Start | `python3 main.py` | `py main.py` |
 | Stop it (started in a terminal) | <kbd>Ctrl</kbd>+<kbd>C</kbd> in that terminal | <kbd>Ctrl</kbd>+<kbd>C</kbd> |
-| Start in the background | `nohup .venv/bin/python main.py > rag.log 2>&1 &` | `Start-Process .venv\Scripts\python.exe main.py -WindowStyle Hidden` |
+| Start in the background | `nohup python3 main.py > rag.log 2>&1 &` | `Start-Process py main.py -WindowStyle Hidden` |
 | Stop it (running in the background) | `kill $(lsof -tiTCP:8080 -sTCP:LISTEN)` | `Stop-Process -Id (Get-NetTCPConnection -LocalPort 8080 -State Listen).OwningProcess` |
 | Is it running? | `curl -s http://127.0.0.1:8080/health` | `Invoke-RestMethod http://127.0.0.1:8080/health` |
 
 If you started the app with another `PORT`, use that number instead of `8080` in the stop and health commands.
 
-**PyCharm:** select the project's `.venv` as the interpreter, open `main.py` and press ▶ *Run*; the ■ *Stop*
-button stops it.
+**PyCharm:** open `main.py` and press ▶ *Run* (any interpreter works: missing packages are installed into the
+project's `.venv` or the selected virtual environment); the ■ *Stop* button stops it.
 
-**Ollama runs separately.** Stopping the app doesn't stop Ollama. Idle models are unloaded automatically after 30
-minutes (`LLM_KEEP_ALIVE`); to free the memory right away run `ollama stop qwen3.5:4b`, or quit the Ollama app.
+**Ollama stops with the app**, when the app is running its own copy (and so does the local image server on macOS).
+If you use your own Ollama installation instead, it keeps running: idle models are unloaded after 30 minutes
+(`LLM_KEEP_ALIVE`), or right away with `ollama stop qwen3.5:4b`.
 
-**Optional local image server (macOS):** start it with `./scripts/ollama_imagegen.sh` and stop it with
-`./scripts/ollama_imagegen.sh stop` (see [Local images on macOS](#local-images-on-macos-flux2-klein)). The app works
-with or without it.
+**Start fresh:** delete the `storage/` folder (index, the app's Ollama copy, its models, and generated images); the
+next `python main.py` sets everything up again.
 
 ---
 
@@ -291,7 +288,7 @@ order, and if one fails the next one is used automatically:
 
 | # | Provider | Cost | Setup |
 |---|---|---|---|
-| 1 | **Local model via Ollama** (`x/flux2-klein:4b`, FLUX.2 [klein], Apache-2.0) | free, offline | macOS: `./scripts/ollama_imagegen.sh` (see [below](#local-images-on-macos-flux2-klein)) |
+| 1 | **Local model via Ollama** (`x/flux2-klein:4b`, FLUX.2 [klein], Apache-2.0) | free, offline | automatic on Macs with ≥ 16 GB (see [below](#local-images-on-macos-flux2-klein)) |
 | 2 | **Cloudflare Workers AI** (FLUX.1 schnell) | free plan: 10,000 neurons/day ≈ 170 images/day | free Cloudflare account → *AI → Workers AI* → create an API token with the *Workers AI* permission, then set `CLOUDFLARE_ACCOUNT_ID` and `CLOUDFLARE_API_TOKEN` |
 | 3 | **Pollinations.ai** (FLUX) | free | nothing (keyless, rate-limited and watermarked); a free account key in `POLLINATIONS_TOKEN` removes the watermark |
 
@@ -307,28 +304,21 @@ How it is wired:
 
 ### Local images on macOS (FLUX.2 klein)
 
-Ollama added local image generation in January 2026, then **temporarily removed it in 0.32.6**, and its release
-notes say to *"continue using 0.32.5 for image generation support"*. Downgrading your main Ollama would hold back
-Qwen, so `scripts/ollama_imagegen.sh` runs **Ollama 0.32.5 as a second, dedicated image server** next to it:
+Ollama added local image generation in January 2026, then **temporarily removed it in version 0.32.6**; its
+release notes say to *"continue using 0.32.5 for image generation support"*. The app handles this by itself, with
+nothing to run or install by hand:
 
-```bash
-./scripts/ollama_imagegen.sh            # first run installs, later runs just start it
-./scripts/ollama_imagegen.sh status
-./scripts/ollama_imagegen.sh stop
-./scripts/ollama_imagegen.sh uninstall  # removes ~/.ollama-imagegen
-```
-
-- **Your regular Ollama is untouched.** 0.32.5 is installed into `~/.ollama-imagegen` (146 MB download), listens on
-  `127.0.0.1:11435`, and has its own model folder. If your regular Ollama already has `x/flux2-klein:4b`, its files
-  are reused as copy-on-write clones (no extra disk space); otherwise the model is downloaded (5.7 GB).
-- **Zero configuration.** The app looks for the image server every 30 s, with no restart and no `.env` change
-  needed. While it runs, images are generated locally; when it's stopped, the free APIs take over.
+- **Automatic on Macs with ≥ 16 GB RAM** (`LOCAL_IMAGES=auto`; `on` forces it, `off` disables it). In the background
+  after startup, the app downloads Ollama 0.32.5 into `storage/runtime/` (146 MB) and runs it on
+  `127.0.0.1:11435` for images only. It reuses `x/flux2-klein:4b` from your regular Ollama when present (zero-copy
+  clones); otherwise it downloads the model (5.7 GB). The image toggle shows the progress.
+- **Your regular Ollama is untouched** and keeps serving Qwen. If the app is running its own Ollama anyway (no
+  Ollama on the machine), that same copy serves images too.
+- **It starts and stops with the app.** While it's being set up, or if it fails, the free APIs are used.
 - **The answer is not slowed down.** Local images start once the answer is complete. Measured on an M1 Pro with
-  16 GB: the answer took 18 s as usual, then the 1024×576 image took ~40 s, peaking at ~7.6 GB of memory.
-- When Ollama restores image generation in a future release, just stop the script: the app then uses your main
-  Ollama. To point it at another server, set `OLLAMA_IMAGE_BASE_URL`.
-
-On Linux and Windows the script isn't needed: the app uses the free external APIs.
+  16 GB: the answer took ~20 s as usual, then a 1024×576 image took ~40–45 s, peaking at ~7.6 GB of memory.
+- On Linux and Windows the app uses the free external APIs. Set `OLLAMA_IMAGE_BASE_URL` to use another Ollama
+  server for images.
 
 **Why no Gemini, OpenAI or Hugging Face?** They aren't free for image generation through their APIs (checked
 October 2026). Gemini's "Nano Banana" models have no free API tier: they're free only inside the Gemini / AI Studio
@@ -347,6 +337,8 @@ commented list. The main ones:
 | `DATA_PATH` | `data/arxiv_2.9k.jsonl` | dataset file, directory or URL |
 | `HOST` / `PORT` | `127.0.0.1` / `8080` | web server |
 | `OLLAMA_BASE_URL` | `http://127.0.0.1:11434` | also honours `OLLAMA_HOST` |
+| `MANAGED_OLLAMA` | `true` | no Ollama running on a local URL → the app downloads and runs its own copy in `storage/runtime/` |
+| `LOCAL_IMAGES` | `auto` | local FLUX.2 images on macOS: `auto` (≥ 16 GB RAM), `on`, `off` |
 | `LLM_MODEL` | `qwen3.5:4b` | any Ollama chat model |
 | `EMBED_MODEL` | `nomic-embed-text` | any Ollama embedding model (`bge-m3` for multilingual) |
 | `AUTO_PULL_MODELS` | `true` | download missing models on startup |
@@ -366,6 +358,7 @@ CLI flags override the environment: `python main.py --data-path ... --port 9000 
 
 | Component | Default | Download | Runs on |
 |---|---|---|---|
+| Ollama runtime | your running Ollama, else the app's own 0.32.5 copy | 146 MB (macOS) / ~1.4 GB (Linux, Windows) | `storage/runtime/` |
 | LLM | `qwen3.5:4b` | 3.3 GB | Ollama (Metal / CUDA / CPU) |
 | Embeddings | `nomic-embed-text` (768-d) | 274 MB | Ollama |
 | Reranker | `cross-encoder/ms-marco-MiniLM-L6-v2` | 90 MB | ONNX Runtime, CPU |
@@ -421,7 +414,7 @@ Run it yourself (stop the web app first so the two don't compete for the GPU):
 
 ```bash
 pip install -r requirements-dev.txt
-pytest -q          # 49 tests, ~3 s, fully offline
+pytest -q          # 55 tests, ~4 s, fully offline
 ```
 
 The suite never touches Ollama or the network: it uses deterministic bag-of-words embeddings and LangChain's
@@ -461,11 +454,10 @@ The suite never touches Ollama or the network: it uses deterministic bag-of-word
 │   ├── images.py            # bonus image providers
 │   ├── service.py           # startup orchestration, dataset watcher, answer/stream
 │   ├── server.py            # FastAPI: UI, /answer, /stream, /api/*
-│   ├── setup_models.py      # Ollama checks + model downloads (also a CLI)
+│   ├── setup_models.py      # Ollama checks + model downloads (also an optional CLI)
+│   ├── runtime.py           # the app's own Ollama: download, start/stop, model reuse
 │   └── static/              # the web UI (vanilla HTML/CSS/JS, no build step)
 ├── scripts/
-│   ├── setup.sh / setup.ps1 # one-shot installers
-│   ├── ollama_imagegen.sh   # local FLUX.2 klein image server (Ollama 0.32.5, macOS)
 │   └── eval_retrieval.py    # retrieval benchmark
 └── tests/                   # offline pytest suite
 ```
@@ -474,9 +466,10 @@ The suite never touches Ollama or the network: it uses deterministic bag-of-word
 
 ## Design decisions
 
-- **Ollama for every model call.** One local runtime serves the LLM and the embeddings, with GPU acceleration
-  where available and CPU otherwise. Model downloads are a single API call, which is what makes
-  "pip install + run" possible without Docker.
+- **Ollama for every model call, installed by the app itself.** One local runtime serves the LLM, the embeddings
+  and (on macOS) images, with GPU acceleration where available and CPU otherwise. When no Ollama is running, the
+  app downloads and supervises its own copy in `storage/`. Together with model pulls through the Ollama API, this
+  is what makes "pip install + `python main.py`" the whole installation, without Docker.
 - **Qwen 3.5 4B with thinking off.** It is fast (~35 tok/s on an M1) and its structured-output support makes query
   planning reliable. Thinking can be switched on (`LLM_THINKING=true`): the reasoning streams into a collapsible
   panel and an extra token budget is reserved for it. Expect answers to take ~4× longer (≈60 s instead of ≈15 s).
@@ -504,13 +497,13 @@ The suite never touches Ollama or the network: it uses deterministic bag-of-word
 
 | Symptom | Fix |
 |---|---|
-| UI says *Waiting for Ollama* | Start it (open the Ollama app or run `ollama serve`), or set `OLLAMA_BASE_URL`. |
-| First start is slow | Models are downloading; progress is shown in the UI and the terminal. Later starts take seconds. |
+| UI says *Waiting for Ollama* | Only happens with a remote `OLLAMA_BASE_URL` (or `MANAGED_OLLAMA=false`): start Ollama on that server. With the default local URL the app runs its own copy. |
+| First start is slow | Ollama and the models are downloading into `storage/`; progress is shown in the UI and the terminal. Later starts take seconds. |
 | The first answer after a while is slow | Ollama unloads idle models after `LLM_KEEP_ALIVE` (30 min). Other apps using *different* Ollama models at the same time can also force model swaps. |
 | Out of memory / very slow on CPU | Use a smaller `LLM_MODEL` (see [hardware](#models-and-hardware)), lower `LLM_NUM_CTX` to `4096`, or set `QUERY_REWRITE=false`. |
 | `Reranker unavailable` in the logs | The first run couldn't reach Hugging Face. The app keeps working without reranking; it retries on the next start. Disable it with `RERANKER_MODEL=none`. |
 | Image: *keyless tier is rate-limited / failed* | The keyless tier is best-effort (rate limits, occasional outages). Add a free `POLLINATIONS_TOKEN` or a free Cloudflare Workers AI account (see [image generation](#bonus-image-generation)). |
-| Image: *This Ollama version cannot generate images* | Expected with Ollama ≥ 0.32.6, which temporarily removed image generation. On macOS run `./scripts/ollama_imagegen.sh` for local images; otherwise the app falls back to the free APIs automatically. |
+| Image: *This Ollama version cannot generate images* | Expected with Ollama ≥ 0.32.6. On Macs with ≥ 16 GB the app sets up its own Ollama 0.32.5 image server automatically (`LOCAL_IMAGES`); meanwhile, and elsewhere, the free APIs are used. |
 | Port 8080 is busy | `PORT=9000 python main.py` |
 
 ---

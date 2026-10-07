@@ -8,7 +8,9 @@ from dataclasses import replace
 import httpx
 import pytest
 
-from rag_app.images import IMAGEGEN_URL, ImageGenerationError, ImageGenerator
+from rag_app.images import ImageGenerationError, ImageGenerator
+
+IMAGEGEN_URL = "http://127.0.0.1:11435"  # LOCAL_IMAGE_PORT default
 
 PNG = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII="

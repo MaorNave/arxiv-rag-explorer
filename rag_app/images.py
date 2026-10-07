@@ -5,10 +5,9 @@ one fails the next one is used:
 
     ollama        local and free: OLLAMA_IMAGE_MODEL (x/flux2-klein:4b) on an Ollama server that
                   can generate images. Ollama removed image generation in 0.32.6 ("continue
-                  using 0.32.5"), so scripts/ollama_imagegen.sh runs a dedicated 0.32.5 server
-                  on port 11435 next to the main Ollama; the main server is used as soon as it
-                  supports images again. Runs *after* the answer so it never competes with the
-                  LLM for the GPU.
+                  using 0.32.5"), so on macOS the app sets up and runs its own 0.32.5 server
+                  (see runtime.py). Runs *after* the answer so it never competes with the LLM
+                  for the GPU.
     cloudflare    free external API: Cloudflare Workers AI's free plan includes 10,000
                   neurons per day (about 170 FLUX.1 schnell images). Needs a free account:
                   CLOUDFLARE_ACCOUNT_ID + CLOUDFLARE_API_TOKEN.
@@ -51,9 +50,9 @@ _POLLINATIONS_ADVICE = (
 )
 _OLLAMA_UNSUPPORTED = (
     "This Ollama version cannot generate images (experimental image generation was removed in "
-    "Ollama 0.32.6); run scripts/ollama_imagegen.sh for local images, using the free APIs meanwhile"
+    "Ollama 0.32.6); using the free external APIs instead"
 )
-IMAGEGEN_URL = "http://127.0.0.1:11435"  # where scripts/ollama_imagegen.sh serves Ollama 0.32.5
+
 
 
 class ImageGenerationError(RuntimeError):
@@ -98,8 +97,8 @@ class ImageGenerator:
         """Ollama servers to look for the local image model on, in order of preference."""
         if self.settings.ollama_image_base_url:
             urls = [self.settings.ollama_image_base_url]
-        else:
-            urls = [IMAGEGEN_URL, self.settings.ollama_base_url]
+        else:  # the app's own image server (Ollama 0.32.5), then the main Ollama
+            urls = [f"http://127.0.0.1:{self.settings.local_image_port}", self.settings.ollama_base_url]
         return [u for u in dict.fromkeys(urls) if u not in self.unsupported_urls]
 
     # ------------------------------------------------------------------ provider selection

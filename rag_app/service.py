@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import sys
+import threading
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -23,6 +25,14 @@ from .index_manager import BuildCancelledError, IndexManager, IndexNotReadyError
 from .llm import build_analyzer, build_chat_model
 from .reranker import CrossEncoderReranker
 from .retriever import HybridRetriever
+from .runtime import (
+    RuntimeManager,
+    import_model,
+    is_local_url,
+    supports_image_generation,
+    system_models_dir,
+    total_memory_gb,
+)
 from .setup_models import (
     INSTALL_HINT,
     ensure_models,
@@ -30,6 +40,7 @@ from .setup_models import (
     model_capabilities,
     normalize,
     ollama_version,
+    pull_model,
 )
 from .status import StatusTracker
 
@@ -74,6 +85,8 @@ class RAGService:
         self.reranker = reranker
         self.reranker_error: str | None = None
         self.use_ollama = use_ollama
+        self.runtime = RuntimeManager(settings)
+        self.image_setup: dict[str, Any] = {"state": "idle", "message": None, "percent": None}
         self.data_path = settings.data_path
         self.dataset_path: Path | None = None
         self.ollama_version: str | None = None
@@ -94,6 +107,7 @@ class RAGService:
         for task in list(self._tasks):
             task.cancel()
         await asyncio.gather(*self._tasks, return_exceptions=True)
+        await asyncio.to_thread(self.runtime.stop)  # the app's own Ollama servers stop with the app
 
     def _spawn(self, coro) -> asyncio.Task:
         task = asyncio.create_task(coro)
@@ -111,8 +125,9 @@ class RAGService:
                     model_capabilities, self.settings.ollama_base_url, self.settings.llm_model
                 )
                 supports_thinking = "thinking" in capabilities if capabilities else True
-            await self._load_reranker()
             self._build_pipeline(supports_thinking)
+            # Optional: the app answers right away and turns reranking on once the model is loaded.
+            self._spawn(self._load_reranker())
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -124,12 +139,16 @@ class RAGService:
         if self.settings.watch_dataset:
             self._spawn(self._watch_dataset())
         if self.use_ollama and self.image_generator.mode in ("auto", "ollama"):
+            self._spawn(self._setup_local_images())
             self._spawn(self._watch_local_image())
         if self.use_ollama and self.index.active is not None:
             self._spawn(self._warm_up(supports_thinking))
 
     async def _wait_for_ollama(self) -> None:
         url = self.settings.ollama_base_url
+        self.ollama_version = await asyncio.to_thread(ollama_version, url)
+        if not self.ollama_version and self.runtime.can_run_main():
+            await self._start_managed_ollama()
         hinted = False
         while True:
             self.ollama_version = await asyncio.to_thread(ollama_version, url)
@@ -141,9 +160,76 @@ class RAGService:
                 hinted = True
             self.status.set_state(
                 "waiting_for_ollama",
-                f"Waiting for Ollama at {url}. Install it from ollama.com and start it; this page updates automatically.",
+                f"Waiting for Ollama at {url}. Start it there (or use a local OLLAMA_BASE_URL so the app can "
+                "run its own copy); this page updates automatically.",
             )
             await asyncio.sleep(3)
+
+    async def _start_managed_ollama(self) -> None:
+        """No Ollama is running: download a private copy into STORAGE_DIR/runtime and run it."""
+        s = self.settings
+
+        def progress(percent: float | None, text: str) -> None:
+            self.status.update(state="installing_runtime", message=f"No Ollama running: {text}",
+                               progress={"percent": percent, "status": text})
+
+        self.status.set_state("installing_runtime", "No Ollama running: setting up the app's own copy…")
+        reuse = [s.llm_model, s.embed_model] + ([s.ollama_image_model] if self._local_images_wanted() else [])
+        try:
+            await asyncio.to_thread(self.runtime.start_main, reuse, progress)
+        except Exception as exc:
+            log.warning("Could not run the app's own Ollama: %s", exc)
+            self.status.set_state("error", f"Could not start Ollama automatically: {exc}", error=str(exc))
+            return
+        self.ollama_version = await asyncio.to_thread(ollama_version, s.ollama_base_url)
+
+    def _local_images_wanted(self) -> bool:
+        s = self.settings
+        if s.local_images == "off" or not self.use_ollama or self.image_generator.mode not in ("auto", "ollama"):
+            return False
+        if sys.platform != "darwin":
+            return False  # Ollama's image generation was macOS-first; other systems use the free APIs
+        if s.ollama_image_base_url:
+            return False  # the user points at their own image server
+        if s.local_images == "auto":
+            memory = total_memory_gb()
+            return memory is not None and memory >= 15.5  # FLUX.2 klein peaks at ~7.6 GB
+        return True
+
+    async def _setup_local_images(self) -> None:
+        """Make local FLUX images work without any manual step (runs in the background)."""
+        if not self._local_images_wanted():
+            return
+        s = self.settings
+        model = normalize(s.ollama_image_model)
+
+        def progress(percent: float | None, text: str) -> None:
+            self.image_setup = {"state": "installing", "message": text, "percent": percent}
+
+        try:
+            if self.runtime.main is not None:  # the app's own 0.32.5 serves everything, images included
+                url = self.runtime.main.url
+            elif supports_image_generation(self.ollama_version):  # the regular Ollama can still do it
+                url = s.ollama_base_url
+            else:  # the regular Ollama is newer than 0.32.5: run the 0.32.5 copy next to it
+                progress(None, "setting up the local image server")
+                server = await asyncio.to_thread(self.runtime.start_image_server, progress)
+                url = server.url
+            if model not in await asyncio.to_thread(local_models, url):
+                if is_local_url(url) and self.runtime.main is not None:
+                    await asyncio.to_thread(import_model, model, system_models_dir(), self.runtime.models_dir)
+                if model not in await asyncio.to_thread(local_models, url):
+                    await asyncio.to_thread(
+                        pull_model, url, model,
+                        lambda _m, pct, text: progress(pct, f"downloading {model}: {text}"),
+                    )
+            self.image_setup = {"state": "ready", "message": f"{model} at {url}", "percent": None}
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning("Local image setup failed (%s); the free image APIs are used instead", exc)
+            self.image_setup = {"state": "error", "message": str(exc), "percent": None}
+        await self._refresh_local_image()
 
     async def _ensure_models(self) -> None:
         s = self.settings
@@ -182,19 +268,37 @@ class RAGService:
             generator.local_url = found
 
     async def _watch_local_image(self) -> None:
-        """Notice when scripts/ollama_imagegen.sh is started (or stopped) while the app runs."""
+        """Keep the image provider in sync with which local image servers are running."""
         while True:
             await asyncio.sleep(30)
             await self._refresh_local_image()
 
     async def _load_reranker(self) -> None:
+        """Load (first run: download ~90 MB) the cross-encoder without blocking the app.
+
+        A daemon thread is used so that a slow download can never delay shutting the app down.
+        """
         if self.reranker is None or self.reranker.ready:
             return
-        self.status.set_state(
-            "pulling_models", f"Loading the reranker {self.reranker.model} (first run downloads ~90 MB)…"
-        )
+        loop = asyncio.get_running_loop()
+        done: asyncio.Future = loop.create_future()
+
+        def finish(error: BaseException | None = None) -> None:  # runs on the event loop
+            if not done.done():
+                done.set_result(None) if error is None else done.set_exception(error)
+
+        def work() -> None:
+            try:
+                self.reranker.load()
+            except Exception as exc:  # reported below
+                loop.call_soon_threadsafe(finish, exc)
+            else:
+                loop.call_soon_threadsafe(finish)
+
+        threading.Thread(target=work, name="reranker-load", daemon=True).start()
         try:
-            await asyncio.to_thread(self.reranker.load)
+            await done
+            log.info("Reranking is on")
         except Exception as exc:  # the pipeline still works, just without reranking
             self.reranker_error = f"{type(exc).__name__}: {exc}"
             log.warning("Reranker unavailable (%s); continuing with hybrid ranking only", self.reranker_error)
@@ -353,12 +457,20 @@ class RAGService:
                 "llm": self.settings.llm_model,
                 "embedding": self.settings.embed_model,
                 "reranker": self.reranker.model if self.reranker is not None and self.reranker.ready else None,
+                "reranker_state": (
+                    "off" if self.reranker is None else "ready" if self.reranker.ready
+                    else "error" if self.reranker_error else "loading"
+                ),
                 "reranker_error": self.reranker_error,
                 "thinking": self.settings.llm_thinking,
                 "query_rewrite": self.settings.query_rewrite,
             },
             "ollama": {"base_url": self.settings.ollama_base_url, "version": self.ollama_version},
-            "image": self.image_generator.describe(),
+            "image": {**self.image_generator.describe(), "setup": self.image_setup},
+            "runtime": {
+                "managed_ollama": self.runtime.main.url if self.runtime.main else None,
+                "managed_image_server": self.runtime.images.url if self.runtime.images else None,
+            },
             "defaults": {"top_k": self.settings.top_k, "max_top_k": 20},
             "storage_dir": os.fspath(self.settings.storage_dir),
         }

@@ -78,6 +78,9 @@ class Settings:
     llm_model: str = "qwen3.5:4b"
     embed_model: str = "nomic-embed-text"
     auto_pull_models: bool = True
+    # No Ollama running locally? Install and run a private copy in STORAGE_DIR/runtime.
+    managed_ollama: bool = True
+    ollama_runtime_version: str = "0.32.5"
     llm_temperature: float = 0.2
     llm_num_ctx: int = 8192
     llm_num_predict: int = 1024
@@ -113,6 +116,9 @@ class Settings:
     image_timeout_s: float = 120.0
     local_image_timeout_s: float = 600.0
     ollama_image_model: str = "x/flux2-klein:4b"
+    # auto = set up local FLUX images automatically on macOS with >= 16 GB RAM; on; off
+    local_images: str = "auto"
+    local_image_port: int = 11435
     # None = auto: the dedicated image server from scripts/ollama_imagegen.sh, then the main Ollama
     ollama_image_base_url: str | None = None
     cloudflare_account_id: str | None = None
@@ -161,6 +167,8 @@ class Settings:
             llm_model=_env("LLM_MODEL", cls.llm_model),
             embed_model=_env("EMBED_MODEL", cls.embed_model),
             auto_pull_models=_env_bool("AUTO_PULL_MODELS", cls.auto_pull_models),
+            managed_ollama=_env_bool("MANAGED_OLLAMA", cls.managed_ollama),
+            ollama_runtime_version=_env("OLLAMA_RUNTIME_VERSION", cls.ollama_runtime_version),
             llm_temperature=_env_float("LLM_TEMPERATURE", cls.llm_temperature),
             llm_num_ctx=_env_int("LLM_NUM_CTX", cls.llm_num_ctx),
             llm_num_predict=_env_int("LLM_NUM_PREDICT", cls.llm_num_predict),
@@ -190,6 +198,8 @@ class Settings:
             image_timeout_s=_env_float("IMAGE_TIMEOUT_S", cls.image_timeout_s),
             local_image_timeout_s=_env_float("LOCAL_IMAGE_TIMEOUT_S", cls.local_image_timeout_s),
             ollama_image_model=_env("OLLAMA_IMAGE_MODEL", cls.ollama_image_model),
+            local_images=(_env("LOCAL_IMAGES", cls.local_images) or "auto").lower(),
+            local_image_port=_env_int("LOCAL_IMAGE_PORT", cls.local_image_port),
             ollama_image_base_url=(
                 _normalize_ollama_url(_env("OLLAMA_IMAGE_BASE_URL")) if _env("OLLAMA_IMAGE_BASE_URL") else None
             ),

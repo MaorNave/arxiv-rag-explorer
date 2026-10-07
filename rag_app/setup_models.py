@@ -1,8 +1,9 @@
 """Ollama helpers: reachability check, model download and capability detection.
 
-Also a small CLI that downloads the models up front (the app does it on first
-start anyway when AUTO_PULL_MODELS=true): the Qwen chat model and the embedding
-model through Ollama, plus the small cross-encoder reranker from Hugging Face.
+Also a small, optional CLI that downloads everything up front (the app does it on its
+first start anyway): the Qwen chat model and the embedding model through Ollama, plus
+the small cross-encoder reranker from Hugging Face. If no Ollama is running, the app's
+own copy is installed into STORAGE_DIR/runtime and used, like `python main.py` does.
 
     python -m rag_app.setup_models                    # LLM_MODEL + EMBED_MODEL from env/.env
     python -m rag_app.setup_models --llm qwen3.5:9b   # pick another Qwen size
@@ -22,11 +23,8 @@ from .config import Settings
 ProgressCallback = Callable[[str, "float | None", str], None]
 
 INSTALL_HINT = (
-    "Ollama is not reachable at {url}.\n"
-    "  1. Install it from https://ollama.com/download (macOS/Windows app, or on Linux:\n"
-    "     curl -fsSL https://ollama.com/install.sh | sh)\n"
-    "  2. Start it (open the app, or run `ollama serve`)\n"
-    "  3. If it runs elsewhere, set OLLAMA_BASE_URL=http://host:11434"
+    "Ollama is not reachable at {url}. With a local OLLAMA_BASE_URL the app installs and runs its "
+    "own copy automatically (MANAGED_OLLAMA=true); for a remote server, make sure it is running there."
 )
 
 
@@ -106,7 +104,15 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
+    from .runtime import RuntimeManager
+
+    runtime = RuntimeManager(settings)
     version = ollama_version(args.base_url)
+    if version is None and args.base_url == settings.ollama_base_url and runtime.can_run_main():
+        print("No Ollama running: installing the app's own copy into", runtime.dir)
+        runtime.start_main([args.llm, args.embed], lambda pct, text: _cli_progress()("ollama", pct, text))
+        print()
+        version = ollama_version(args.base_url)
     if version is None:
         print(INSTALL_HINT.format(url=args.base_url), file=sys.stderr)
         return 1
@@ -124,6 +130,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  … reranker {settings.reranker_model} (Hugging Face, ~90 MB on first run)")
         CrossEncoderReranker(settings.reranker_model, settings.models_dir, settings.rerank_max_tokens).load()
         print(f"  ✓ {settings.reranker_model}")
+    runtime.stop()
     print("Models are ready. Start the app with:  python main.py")
     return 0
 

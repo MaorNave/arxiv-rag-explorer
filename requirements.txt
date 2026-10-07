@@ -2,14 +2,16 @@
 # arXiv RAG Explorer - Python dependencies
 #
 #   pip install -r requirements.txt
+#   python main.py
 #
-# The language model (Qwen 3.5 via Ollama), the embedding model and the small
-# reranker are NOT Python packages, so pip cannot place their weights on disk.
-# They are downloaded automatically (Ollama models through the `ollama` client):
-#   * on the first `python main.py` (AUTO_PULL_MODELS=true, the default), or
-#   * explicitly with `python -m rag_app.setup_models`, or
-#   * by the one-shot installer: scripts/setup.sh (macOS/Linux) / scripts/setup.ps1 (Windows).
-# The only system prerequisite is Ollama itself: https://ollama.com/download
+# That is the whole installation. Everything that is not a Python package is set up
+# by the app itself on its first run, inside the project's storage/ folder:
+#   * Ollama: the running one is used if present; otherwise the app downloads its own
+#     copy (storage/runtime) and runs it while the app runs,
+#   * the Qwen 3.5 chat model and the embedding model (pulled through Ollama),
+#   * the small cross-encoder reranker (Hugging Face),
+#   * on Macs with >= 16 GB: a local FLUX.2 image model.
+# Optional: `python -m rag_app.setup_models` downloads all of it up front.
 # ---------------------------------------------------------------------------
 
 # Orchestration: LangChain building blocks + LangGraph state machine
@@ -37,3 +39,6 @@ uvicorn>=0.30
 python-multipart>=0.0.9
 httpx>=0.27
 python-dotenv>=1.0
+
+# Unpacks Ollama's Linux release archives (.tar.zst) for the app-managed runtime
+zstandard>=0.22; sys_platform == "linux"

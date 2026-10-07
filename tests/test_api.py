@@ -123,7 +123,7 @@ def test_service_discovers_the_local_image_server(settings, embeddings, monkeypa
     import asyncio
 
     from rag_app import service as service_module
-    from rag_app.images import IMAGEGEN_URL
+    IMAGEGEN_URL = "http://127.0.0.1:11435"  # LOCAL_IMAGE_PORT default
 
     servers = {IMAGEGEN_URL: {"x/flux2-klein:4b"}, settings.ollama_base_url: {"qwen3.5:4b"}}
 
@@ -142,3 +142,54 @@ def test_service_discovers_the_local_image_server(settings, embeddings, monkeypa
     asyncio.run(service._refresh_local_image())
     assert service.image_generator.local_url is None
     assert service.image_generator.chain() == ["pollinations"]
+
+
+def test_app_is_ready_while_the_reranker_is_still_downloading(settings, embeddings):
+    import threading
+
+    release = threading.Event()
+
+    class SlowReranker:
+        model = "slow-cross-encoder"
+        ready = False
+
+        def load(self):
+            release.wait(10)  # e.g. a slow first download from Hugging Face
+            self.ready = True
+
+        def score(self, query, texts):
+            return [0.0] * len(texts)
+
+    reranker = SlowReranker()
+    service = RAGService(settings, embeddings=embeddings, llm=fake_llm(), reranker=reranker, use_ollama=False)
+    with TestClient(create_app(settings, service)) as client:
+        status = wait_ready(client)
+        assert status["models"]["reranker_state"] == "loading"
+        body = client.post("/answer", json={"query": "What is RLBFF?"}).json()
+        assert body["answer"] and "cross-encoder" not in body["metrics"]["retrieval_mode"]
+        release.set()
+        deadline = time.time() + 5
+        while time.time() < deadline and not reranker.ready:
+            time.sleep(0.05)
+        body = client.post("/answer", json={"query": "What is RLBFF?"}).json()
+        assert "cross-encoder rerank (slow-cross-encoder)" in body["metrics"]["retrieval_mode"]
+        assert client.get("/api/status").json()["models"]["reranker_state"] == "ready"
+
+
+def test_reranker_failure_is_reported_and_answers_keep_working(settings, embeddings):
+    class BrokenReranker:
+        model = "broken-cross-encoder"
+        ready = False
+
+        def load(self):
+            raise OSError("Hugging Face is unreachable")
+
+    service = RAGService(settings, embeddings=embeddings, llm=fake_llm(), reranker=BrokenReranker(), use_ollama=False)
+    with TestClient(create_app(settings, service)) as client:
+        wait_ready(client)
+        deadline = time.time() + 5
+        while time.time() < deadline and client.get("/api/status").json()["models"]["reranker_state"] != "error":
+            time.sleep(0.05)
+        models = client.get("/api/status").json()["models"]
+        assert models["reranker_state"] == "error" and "unreachable" in models["reranker_error"]
+        assert client.post("/answer", json={"query": "What is RLBFF?"}).json()["answer"]

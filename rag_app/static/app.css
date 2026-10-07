@@ -128,7 +128,7 @@ svg.icon { width: 1em; height: 1em; flex: none; stroke: currentColor; fill: none
 .status-pill .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--amber); flex: none; box-shadow: 0 0 0 0 currentColor; }
 .status-pill[data-state="ready"] .dot { background: var(--green); }
 .status-pill[data-state="error"] .dot { background: var(--rose); }
-.status-pill[data-state="indexing"] .dot, .status-pill[data-state="pulling_models"] .dot { background: var(--accent); animation: pulse 1.4s infinite; }
+.status-pill[data-state="indexing"] .dot, .status-pill[data-state="pulling_models"] .dot, .status-pill[data-state="installing_runtime"] .dot { background: var(--accent); animation: pulse 1.4s infinite; }
 .status-pill[data-state="starting"] .dot, .status-pill[data-state="waiting_for_ollama"] .dot { animation: pulse 1.4s infinite; }
 @keyframes pulse { 0% { box-shadow: 0 0 0 0 rgba(99, 102, 241, 0.45); } 70% { box-shadow: 0 0 0 7px rgba(99, 102, 241, 0); } 100% { box-shadow: 0 0 0 0 rgba(99, 102, 241, 0); } }
 

@@ -186,7 +186,7 @@
 
   // ------------------------------------------------------------------ status polling
   function stepState(state) {
-    return { starting: 0, waiting_for_ollama: 0, pulling_models: 1, indexing: 2, ready: 4, error: -1 }[state] ?? 0;
+    return { starting: 0, waiting_for_ollama: 0, installing_runtime: 0, pulling_models: 1, indexing: 2, ready: 4, error: -1 }[state] ?? 0;
   }
 
   function applyStatus(s) {
@@ -200,6 +200,7 @@
       ready: docs != null ? `Ready · ${fmtNum(docs)} abstracts` : "Ready",
       indexing: `Indexing ${pct}`.trim(),
       pulling_models: `Downloading model ${pct}`.trim(),
+      installing_runtime: `Installing Ollama ${pct}`.trim(),
       waiting_for_ollama: "Waiting for Ollama",
       starting: "Starting…",
       error: "Needs attention",
@@ -252,7 +253,10 @@
     sw.classList.toggle("disabled", !img.available);
     box.disabled = !img.available;
     if (!img.available) box.checked = false;
-    $("#image-provider").textContent = img.available ? `via ${img.label}${img.keyless ? " (keyless)" : ""}` : "(not configured)";
+    const setup = img.setup || {};
+    const preparing = setup.state === "installing"
+      ? ` · preparing local FLUX${setup.percent != null ? ` ${Math.round(setup.percent)}%` : ""}` : "";
+    $("#image-provider").textContent = img.available ? `via ${img.label}${img.keyless ? " (keyless)" : ""}${preparing}` : "(not configured)";
     const chain = (img.chain || []).join(" → ");
     sw.title = img.available
       ? `Bonus: free image generation via ${chain || img.label}${img.model ? ` (${img.model})` : ""}; ` +
@@ -696,7 +700,9 @@
         ["Embeddings", `${esc(s.models.embedding)} · ${ix.embedding_dimensions || "?"} dims`],
         ["Vector store", esc(ix.vector_store)],
         ["Keyword index", esc(ix.keyword_index)],
-        ["Reranker", s.models.reranker ? esc(s.models.reranker) : `off${s.models.reranker_error ? ` (${esc(s.models.reranker_error)})` : ""}`],
+        ["Reranker", s.models.reranker ? esc(s.models.reranker)
+          : s.models.reranker_state === "loading" ? "loading (first run downloads ~90 MB); answers work meanwhile"
+          : `off${s.models.reranker_error ? ` (${esc(s.models.reranker_error)})` : ""}`],
         ["Built", `${built.toLocaleString()} in ${ix.build_seconds}s`],
       );
     } else {
