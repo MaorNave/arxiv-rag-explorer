@@ -253,8 +253,10 @@
     box.disabled = !img.available;
     if (!img.available) box.checked = false;
     $("#image-provider").textContent = img.available ? `via ${img.label}${img.keyless ? " (keyless)" : ""}` : "(not configured)";
+    const chain = (img.chain || []).join(" → ");
     sw.title = img.available
-      ? `Bonus: illustrate the answer with ${img.label}${img.model ? ` (${img.model})` : ""}; runs in parallel with the text answer`
+      ? `Bonus: free image generation via ${chain || img.label}${img.model ? ` (${img.model})` : ""}; ` +
+        (img.runs_after_answer ? "the local model starts once the answer is complete" : "runs in parallel with the text answer")
       : img.reason || "Image generation is not configured";
 
     if (!wasReady && S.ready) { loadExamples(); autoAskFromUrl(); }
@@ -327,7 +329,8 @@
   }
 
   function resetPipeline(withImage) {
-    const defaults = { understand: "query plan", retrieve: "hybrid search", rerank: "cross-encoder", generate: "grounded answer", image: "in parallel" };
+    const afterAnswer = Boolean(S.status && S.status.image && S.status.image.runs_after_answer);
+    const defaults = { understand: "query plan", retrieve: "hybrid search", rerank: "cross-encoder", generate: "grounded answer", image: afterAnswer ? "after answer" : "in parallel" };
     $$(".step").forEach((el) => { el.dataset.status = ""; $("small", el).textContent = defaults[el.dataset.step]; });
     $$(".image-only").forEach((el) => el.classList.toggle("hidden", !withImage));
     $("#pipeline").classList.remove("hidden");
@@ -347,8 +350,9 @@
     $("#image-card").classList.toggle("hidden", !S.genImage);
     if (S.genImage) {
       const label = (S.status && S.status.image && S.status.image.label) || "image API";
+      const when = S.status && S.status.image && S.status.image.runs_after_answer ? "once the answer is ready" : "in parallel";
       $("#image-meta").textContent = label;
-      $("#image-body").innerHTML = `<div class="image-frame loading">Generating an illustration with ${esc(label)} in parallel…</div>`;
+      $("#image-body").innerHTML = `<div class="image-frame loading">Generating an illustration with ${esc(label)} ${when}…</div>`;
     }
     $("#sources").innerHTML = '<div class="empty">Searching the index…</div>';
     $("#context-count").textContent = "";
@@ -700,7 +704,7 @@
     }
     rows.push(
       ["LLM", `${esc((s.models || {}).llm || "?")} via Ollama ${esc((s.ollama || {}).version || "")}`],
-      ["Images", esc((s.image && (s.image.available ? `${s.image.label} (${s.image.model})` : s.image.reason)) || "–")],
+      ["Images", esc((s.image && (s.image.available ? (s.image.chain || [s.image.label]).join(" → ") : s.image.reason)) || "–")],
     );
     $("#dataset-details").innerHTML = `<dl class="kv">${rows.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join("")}</dl>`;
   }

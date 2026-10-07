@@ -100,6 +100,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--embed", default=settings.embed_model, help=f"embedding model (default: {settings.embed_model})")
     parser.add_argument("--base-url", default=settings.ollama_base_url, help="Ollama server URL")
     parser.add_argument("--no-reranker", action="store_true", help="skip the cross-encoder download")
+    parser.add_argument(
+        "--image", action="store_true",
+        help=f"also pull the local image model ({settings.ollama_image_model}, ~5.7 GB) for illustrations",
+    )
     args = parser.parse_args(argv)
 
     version = ollama_version(args.base_url)
@@ -107,10 +111,11 @@ def main(argv: list[str] | None = None) -> int:
         print(INSTALL_HINT.format(url=args.base_url), file=sys.stderr)
         return 1
     print(f"Ollama {version} at {args.base_url}")
-    pulled = ensure_models(args.base_url, [args.llm, args.embed], on_progress=_cli_progress())
+    models = [args.llm, args.embed] + ([settings.ollama_image_model] if args.image else [])
+    pulled = ensure_models(args.base_url, models, on_progress=_cli_progress())
     if pulled:
         print()
-    for model in (args.llm, args.embed):
+    for model in models:
         state = "downloaded" if model in pulled else "already present"
         print(f"  ✓ {model} ({state})")
     if settings.reranker_enabled and not args.no_reranker:

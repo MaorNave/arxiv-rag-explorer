@@ -3,6 +3,9 @@
     START -> understand_query -> retrieve -> rerank -+-> generate_answer --+-> finalize -> END
                                                      +-> generate_image ---+   (if requested)
 
+    With a local image model the image is generated after the answer instead:
+    ... -> rerank -> generate_answer -> generate_image -> finalize
+
 * understand_query  LLM (structured output) rewrites the question into English search
                     queries + keywords + topic; falls back to a heuristic plan.
 * retrieve          hybrid dense + BM25 retrieval fused with weighted Reciprocal Rank Fusion
@@ -10,8 +13,9 @@
 * rerank            local cross-encoder (ONNX) re-scores the candidates against the
                     question and keeps the top-k (pass-through if no reranker is loaded).
 * generate_answer   grounded, cited answer streamed token by token from the local LLM.
-* generate_image    optional external text-to-image call. It runs in the same
-                    super-step as generate_answer, so it never delays the text.
+* generate_image    optional image. External APIs run in the same super-step as
+                    generate_answer (concurrently); a local model runs right after it, so
+                    it never competes with the LLM. Either way the text is never delayed.
 * finalize          assembles the response JSON (answer, citations, context, metrics).
 
 Nodes publish progress through LangGraph's custom stream (``get_stream_writer``),
@@ -59,6 +63,7 @@ class RAGState(TypedDict, total=False):
     question: str
     top_k: int
     generate_image: bool
+    image_after_answer: bool
     started_at: float
     # produced by the nodes
     plan: dict[str, Any]
@@ -253,7 +258,9 @@ def build_graph(deps: PipelineDeps):
         plan.update(queries_used=queries, query_weights=weights, bm25_keywords=keywords)
         elapsed = _ms(started)
         write({"event": "analysis", "data": {**plan, "ms": elapsed}})
-        return {"plan": plan, "timings": {"analysis_ms": elapsed}}
+        # Decided once per request so that a provider fallback cannot change the routing mid-way.
+        after = bool(state.get("generate_image") and deps.image_generator and deps.image_generator.runs_after_answer)
+        return {"plan": plan, "timings": {"analysis_ms": elapsed}, "image_after_answer": after}
 
     async def retrieve(state: RAGState) -> dict:
         write = get_stream_writer()
@@ -306,9 +313,14 @@ def build_graph(deps: PipelineDeps):
 
     def route_after_retrieval(state: RAGState) -> list[str]:
         targets = ["generate_answer"]
-        if state.get("generate_image") and deps.image_generator is not None:
-            targets.append("generate_image")
+        if state.get("generate_image") and deps.image_generator is not None and not state.get("image_after_answer"):
+            targets.append("generate_image")  # external API: run concurrently with the answer
         return targets
+
+    def route_after_answer(state: RAGState) -> str:
+        if state.get("generate_image") and deps.image_generator is not None and state.get("image_after_answer"):
+            return "generate_image"  # local model: start once the LLM is done
+        return "finalize"
 
     async def generate_answer(state: RAGState, config: RunnableConfig) -> dict:
         write = get_stream_writer()
@@ -371,8 +383,10 @@ def build_graph(deps: PipelineDeps):
         write({"event": "step", "data": {"step": "image", "status": "running"}})
         started = time.perf_counter()
         prompt = build_image_prompt(state["question"], state.get("plan"))
+        # Each provider has its own timeout; this is only a safety net for the whole fallback chain.
+        budget = settings.local_image_timeout_s + 2 * settings.image_timeout_s + 30
         try:
-            image = await asyncio.wait_for(deps.image_generator.generate(prompt), timeout=settings.image_timeout_s)
+            image = await asyncio.wait_for(deps.image_generator.generate(prompt), timeout=budget)
             images, error = [image], None
         except Exception as exc:
             log.warning("Image generation failed: %s", exc)
@@ -435,7 +449,7 @@ def build_graph(deps: PipelineDeps):
     graph.add_edge("understand_query", "retrieve")
     graph.add_edge("retrieve", "rerank")
     graph.add_conditional_edges("rerank", route_after_retrieval, ["generate_answer", "generate_image"])
-    graph.add_edge("generate_answer", "finalize")
+    graph.add_conditional_edges("generate_answer", route_after_answer, ["generate_image", "finalize"])
     graph.add_edge("generate_image", "finalize")
     graph.add_edge("finalize", END)
     return graph.compile(name="arxiv-rag")

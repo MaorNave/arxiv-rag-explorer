@@ -26,7 +26,9 @@ from .retriever import HybridRetriever
 from .setup_models import (
     INSTALL_HINT,
     ensure_models,
+    local_models,
     model_capabilities,
+    normalize,
     ollama_version,
 )
 from .status import StatusTracker
@@ -150,12 +152,19 @@ class RAGService:
             self.status.update(state="pulling_models", message=label,
                                progress={"model": model, "percent": percent, "status": text})
 
+        models = [s.llm_model, s.embed_model]
+        if s.image_provider == "ollama":  # explicitly chosen local image model: download it too
+            models.append(s.ollama_image_model)
         pulled = await asyncio.to_thread(
-            ensure_models, s.ollama_base_url, [s.llm_model, s.embed_model],
+            ensure_models, s.ollama_base_url, models,
             pull=s.auto_pull_models, on_progress=on_progress,
         )
         if pulled:
             log.info("Downloaded Ollama models: %s", ", ".join(pulled))
+        installed = await asyncio.to_thread(local_models, s.ollama_base_url)
+        self.image_generator.local_installed = normalize(s.ollama_image_model) in installed
+        if self.image_generator.local_installed:
+            log.info("Local image model %s found; it is tried first for illustrations", s.ollama_image_model)
 
     async def _load_reranker(self) -> None:
         if self.reranker is None or self.reranker.ready:

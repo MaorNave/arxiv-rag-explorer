@@ -105,20 +105,16 @@ class Settings:
     watch_interval_s: float = 10.0
     max_upload_mb: int = 512
 
-    # Bonus: image generation through an external API
+    # Bonus: image generation, free options only (local Ollama, then free external APIs)
     image_provider: str = "auto"
     image_timeout_s: float = 120.0
+    local_image_timeout_s: float = 600.0
+    ollama_image_model: str = "x/flux2-klein:4b"
+    cloudflare_account_id: str | None = None
+    cloudflare_api_token: str | None = None
+    cloudflare_image_model: str = "@cf/black-forest-labs/flux-1-schnell"
     pollinations_model: str = "flux"
     pollinations_token: str | None = None
-    openai_api_key: str | None = None
-    openai_base_url: str = "https://api.openai.com/v1"
-    openai_image_model: str = "gpt-image-2.5-flare"
-    openai_image_quality: str = "low"
-    gemini_api_key: str | None = None
-    gemini_image_model: str = "gemini-nano-banana-2.1"
-    hf_token: str | None = None
-    hf_image_model: str = "black-forest-labs/FLUX.1-schnell"
-    hf_image_provider: str = "auto"
 
     log_level: str = "INFO"
 
@@ -187,17 +183,13 @@ class Settings:
             max_upload_mb=_env_int("MAX_UPLOAD_MB", cls.max_upload_mb),
             image_provider=(_env("IMAGE_PROVIDER", cls.image_provider) or "none").lower(),
             image_timeout_s=_env_float("IMAGE_TIMEOUT_S", cls.image_timeout_s),
+            local_image_timeout_s=_env_float("LOCAL_IMAGE_TIMEOUT_S", cls.local_image_timeout_s),
+            ollama_image_model=_env("OLLAMA_IMAGE_MODEL", cls.ollama_image_model),
+            cloudflare_account_id=_env("CLOUDFLARE_ACCOUNT_ID"),
+            cloudflare_api_token=_env("CLOUDFLARE_API_TOKEN"),
+            cloudflare_image_model=_env("CLOUDFLARE_IMAGE_MODEL", cls.cloudflare_image_model),
             pollinations_model=_env("POLLINATIONS_MODEL", cls.pollinations_model),
             pollinations_token=_env("POLLINATIONS_TOKEN") or _env("POLLINATIONS_API_KEY"),
-            openai_api_key=_env("OPENAI_API_KEY"),
-            openai_base_url=_env("OPENAI_BASE_URL", cls.openai_base_url).rstrip("/"),
-            openai_image_model=_env("OPENAI_IMAGE_MODEL", cls.openai_image_model),
-            openai_image_quality=_env("OPENAI_IMAGE_QUALITY", cls.openai_image_quality),
-            gemini_api_key=_env("GEMINI_API_KEY") or _env("GOOGLE_API_KEY"),
-            gemini_image_model=_env("GEMINI_IMAGE_MODEL", cls.gemini_image_model),
-            hf_token=_env("HF_TOKEN") or _env("HUGGINGFACEHUB_API_TOKEN"),
-            hf_image_model=_env("HF_IMAGE_MODEL", cls.hf_image_model),
-            hf_image_provider=_env("HF_IMAGE_PROVIDER", cls.hf_image_provider),
             log_level=(_env("LOG_LEVEL", cls.log_level) or "INFO").upper(),
         )
 

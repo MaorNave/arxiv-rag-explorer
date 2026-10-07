@@ -74,8 +74,8 @@ def index(settings, embeddings, dataset):
 
 
 class FakeImages:
-    def __init__(self, fail=False, delay=0.0):
-        self.fail, self.delay = fail, delay
+    def __init__(self, fail=False, delay=0.0, runs_after_answer=False):
+        self.fail, self.delay, self.runs_after_answer = fail, delay, runs_after_answer
 
     async def generate(self, prompt):
         await asyncio.sleep(self.delay)
@@ -190,3 +190,20 @@ def test_rerank_node_promotes_cross_encoder_choice(settings, index):
     assert response["metrics"]["candidates"] == 5 and response["metrics"]["rerank_ms"] is not None
     assert "cross-encoder" in response["metrics"]["retrieval_mode"]
     assert reranker.queries == ["What is RLBFF?"]
+
+
+def test_local_image_model_runs_after_the_answer(settings, index):
+    deps = PipelineDeps(settings=settings, llm=fake_llm(), get_retriever=lambda: HybridRetriever(index=index, k=3),
+                        image_generator=FakeImages(runs_after_answer=True))
+    graph = build_graph(deps)
+
+    async def events():
+        seen = []
+        async for _mode, chunk in graph.astream(initial_state("What is RLBFF?", 3, True), stream_mode=["custom"]):
+            if chunk["event"] in ("answer", "image") or chunk["data"].get("step") == "image":
+                seen.append(chunk["event"] if chunk["event"] != "step" else "image-start")
+        return seen
+
+    assert asyncio.run(events()) == ["answer", "image-start", "image"]  # sequential, never concurrent
+    response = run_graph(settings, index, image=FakeImages(runs_after_answer=True), generate_image=True)
+    assert response["images"][0]["url"] == "/generated/x.png" and response["answer"]

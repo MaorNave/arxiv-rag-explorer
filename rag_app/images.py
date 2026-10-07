@@ -1,26 +1,27 @@
-"""Bonus feature: illustrate answers with an image from an external text-to-image API.
+"""Bonus feature: illustrate answers with a generated image, using free options only.
 
-IMAGE_PROVIDER selects the backend:
-    auto          (default) first configured of: openai, gemini, pollinations (with key),
-                  huggingface; otherwise Pollinations' keyless tier (best effort)
-    pollinations  POLLINATIONS_TOKEN -> FLUX via gen.pollinations.ai (free key at
-                  https://enter.pollinations.ai); without a key the keyless legacy
-                  endpoint is used, which is rate-limited per IP
-    openai        OPENAI_API_KEY, gpt-image-2.5-flare (any OpenAI image model)
-    gemini        GEMINI_API_KEY, gemini-nano-banana-2.1 ("Nano Banana")
-    huggingface   HF_TOKEN, any HF text-to-image model (FLUX.1-schnell by default), routed by
-                  huggingface_hub to whichever Inference Provider serves it
-    none          feature disabled
+With IMAGE_PROVIDER=auto (default) the providers below are tried in this order, and if
+one fails the next one is used:
 
-Images are generated in a parallel LangGraph branch, so they never delay the text
-answer. The bytes are stored under STORAGE_DIR/images and served at /generated/.
+    ollama        local and free: OLLAMA_IMAGE_MODEL (x/flux2-klein:4b) served by the same
+                  Ollama that runs Qwen. Used when the model is installed and the Ollama
+                  version can generate images (experimental image generation was temporarily
+                  removed in Ollama 0.32.6; this switches on again by itself once it returns).
+                  Runs *after* the answer so it never competes with the LLM for the GPU.
+    cloudflare    free external API: Cloudflare Workers AI's free plan includes 10,000
+                  neurons per day (about 170 FLUX.1 schnell images). Needs a free account:
+                  CLOUDFLARE_ACCOUNT_ID + CLOUDFLARE_API_TOKEN.
+    pollinations  free external API: works without a key (rate-limited per IP, watermarked);
+                  a free account key (POLLINATIONS_TOKEN) removes the watermark.
+
+IMAGE_PROVIDER=ollama|cloudflare|pollinations forces a single provider; none disables the
+feature. External providers run in a parallel LangGraph branch, so they never delay the
+text answer either. Images are stored under STORAGE_DIR/images and served at /generated/.
 """
 
 from __future__ import annotations
 
-import asyncio
 import base64
-import io
 import logging
 import random
 import time
@@ -34,40 +35,37 @@ from .config import Settings
 
 log = logging.getLogger(__name__)
 
+PROVIDERS = ("ollama", "cloudflare", "pollinations")
 PROVIDER_LABELS = {
+    "ollama": "Ollama (local)",
+    "cloudflare": "Cloudflare Workers AI",
     "pollinations": "Pollinations.ai",
-    "openai": "OpenAI Images",
-    "gemini": "Google Gemini",
-    "huggingface": "Hugging Face Inference",
 }
 _DISABLED = {"", "none", "off", "disabled", "false"}
-_EXTENSIONS = {"image/png": "png", "image/jpeg": "jpg", "image/jpg": "jpg", "image/webp": "webp", "image/gif": "gif"}
+_EXTENSIONS = {"image/png": "png", "image/jpeg": "jpg", "image/webp": "webp", "image/gif": "gif"}
 _KEEP_IMAGES = 200
-_KEY_ADVICE = (
-    "Get a free key at https://enter.pollinations.ai and set POLLINATIONS_TOKEN, or configure "
-    "OPENAI_API_KEY / GEMINI_API_KEY / HF_TOKEN (see README)."
+_POLLINATIONS_ADVICE = (
+    "A free account key (POLLINATIONS_TOKEN, https://enter.pollinations.ai) or a free Cloudflare "
+    "Workers AI account (CLOUDFLARE_ACCOUNT_ID + CLOUDFLARE_API_TOKEN) gives reliable images; see README."
 )
-_KEYLESS_LIMITED = "Pollinations' keyless tier is rate-limited per IP (HTTP {status}). " + _KEY_ADVICE
-_KEYLESS_DOWN = "Pollinations' keyless tier is best-effort and failed this time (HTTP {status}). " + _KEY_ADVICE
+_OLLAMA_UNSUPPORTED = (
+    "This Ollama version cannot generate images (experimental image generation was removed in "
+    "Ollama 0.32.6); using the free external APIs instead"
+)
 
 
 class ImageGenerationError(RuntimeError):
     pass
 
 
-def resolve_provider(settings: Settings) -> str:
-    provider = settings.image_provider
-    if provider != "auto":
-        return provider
-    if settings.openai_api_key:
-        return "openai"
-    if settings.gemini_api_key:
-        return "gemini"
-    if settings.pollinations_token:
-        return "pollinations"
-    if settings.hf_token:
-        return "huggingface"
-    return "pollinations"
+def _sniff_mime(data: bytes) -> str:
+    if data.startswith(b"\x89PNG"):
+        return "image/png"
+    if data.startswith(b"\xff\xd8"):
+        return "image/jpeg"
+    if data[8:12] == b"WEBP":
+        return "image/webp"
+    return "image/png"
 
 
 def build_image_prompt(question: str, plan: dict | None = None) -> str:
@@ -88,61 +86,104 @@ def build_image_prompt(question: str, plan: dict | None = None) -> str:
 class ImageGenerator:
     def __init__(self, settings: Settings, transport: httpx.AsyncBaseTransport | None = None):
         self.settings = settings
-        self.provider = resolve_provider(settings)
+        self.mode = settings.image_provider
         self.output_dir: Path = settings.images_dir
         self._transport = transport  # injectable for offline tests
+        self.local_installed = False  # set by the service once Ollama has been checked
+        self.local_unsupported = False  # set when this Ollama version refuses image generation
+
+    # ------------------------------------------------------------------ provider selection
+    @property
+    def cloudflare_configured(self) -> bool:
+        return bool(self.settings.cloudflare_account_id and self.settings.cloudflare_api_token)
+
+    def chain(self) -> list[str]:
+        """Providers to try, in order."""
+        if self.mode in _DISABLED:
+            return []
+        if self.mode != "auto":
+            return [self.mode] if self.mode in PROVIDERS else []
+        chain = []
+        if self.local_installed and not self.local_unsupported:
+            chain.append("ollama")
+        if self.cloudflare_configured:
+            chain.append("cloudflare")
+        chain.append("pollinations")
+        return chain
 
     @property
-    def keyless(self) -> bool:
-        return self.provider == "pollinations" and not self.settings.pollinations_token
+    def provider(self) -> str | None:
+        chain = self.chain()
+        return chain[0] if chain else None
 
     @property
-    def model(self) -> str | None:
-        if self.keyless:
-            return "keyless tier"
-        return {
-            "pollinations": self.settings.pollinations_model,
-            "openai": self.settings.openai_image_model,
-            "gemini": self.settings.gemini_image_model,
-            "huggingface": self.settings.hf_image_model,
-        }.get(self.provider)
+    def runs_after_answer(self) -> bool:
+        """A local model shares the GPU with the LLM, so it waits until the answer is done."""
+        return self.provider == "ollama"
 
     @property
     def unavailable_reason(self) -> str | None:
-        s = self.settings
-        if self.provider in _DISABLED:
+        if self.mode in _DISABLED:
             return "Image generation is disabled (IMAGE_PROVIDER=none)"
-        if self.provider not in PROVIDER_LABELS:
-            return f"Unknown IMAGE_PROVIDER '{self.provider}'"
-        keys = {"openai": ("OPENAI_API_KEY", s.openai_api_key),
-                "gemini": ("GEMINI_API_KEY", s.gemini_api_key),
-                "huggingface": ("HF_TOKEN", s.hf_token)}
-        if self.provider in keys and not keys[self.provider][1]:
-            return f"Set {keys[self.provider][0]} to use the {PROVIDER_LABELS[self.provider]} provider"
+        if self.mode != "auto" and self.mode not in PROVIDERS:
+            return f"Unknown IMAGE_PROVIDER '{self.mode}' (use auto, ollama, cloudflare, pollinations or none)"
+        if self.mode == "cloudflare" and not self.cloudflare_configured:
+            return "Set CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN to use Cloudflare Workers AI"
+        if self.mode == "ollama" and self.local_unsupported:
+            return _OLLAMA_UNSUPPORTED.split(";")[0]
         return None
 
     @property
     def available(self) -> bool:
         return self.unavailable_reason is None
 
-    def describe(self) -> dict:
+    def model_for(self, provider: str | None) -> str | None:
+        if provider == "pollinations" and not self.settings.pollinations_token:
+            return "keyless tier"
         return {
-            "provider": self.provider,
-            "label": PROVIDER_LABELS.get(self.provider, self.provider),
-            "model": self.model,
-            "keyless": self.keyless,
+            "ollama": self.settings.ollama_image_model,
+            "cloudflare": self.settings.cloudflare_image_model.rsplit("/", 1)[-1],
+            "pollinations": self.settings.pollinations_model,
+        }.get(provider)
+
+    def describe(self) -> dict:
+        provider = self.provider
+        return {
+            "provider": provider,
+            "label": PROVIDER_LABELS.get(provider, provider),
+            "model": self.model_for(provider),
+            "keyless": provider == "pollinations" and not self.settings.pollinations_token,
+            "chain": [PROVIDER_LABELS[p] for p in self.chain()],
+            "local": provider == "ollama",
+            "runs_after_answer": self.runs_after_answer,
             "available": self.available,
             "reason": self.unavailable_reason,
         }
 
+    # ------------------------------------------------------------------ generation
     async def generate(self, prompt: str) -> dict:
         if not self.available:
             raise ImageGenerationError(self.unavailable_reason)
-        started = time.perf_counter()
-        timeout = httpx.Timeout(self.settings.image_timeout_s, connect=15.0)
+        errors: list[str] = []
+        for provider in self.chain():
+            started = time.perf_counter()
+            try:
+                data, mime = await self._run(provider, prompt)
+            except (ImageGenerationError, httpx.HTTPError, ValueError) as exc:
+                message = str(exc) or type(exc).__name__
+                log.info("Image provider %s failed: %s", provider, message)
+                errors.append(f"{PROVIDER_LABELS[provider]}: {message}")
+                continue
+            return self._save(data, mime, prompt, provider, started)
+        raise ImageGenerationError(" | ".join(errors) or "No image provider is available")
+
+    async def _run(self, provider: str, prompt: str) -> tuple[bytes, str]:
+        seconds = self.settings.local_image_timeout_s if provider == "ollama" else self.settings.image_timeout_s
+        timeout = httpx.Timeout(seconds, connect=15.0)
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, transport=self._transport) as client:
-            handler = getattr(self, f"_{self.provider}")
-            data, mime = await handler(client, prompt)
+            return await getattr(self, f"_{provider}")(client, prompt)
+
+    def _save(self, data: bytes, mime: str, prompt: str, provider: str, started: float) -> dict:
         if not data:
             raise ImageGenerationError("The provider returned an empty image")
         name = f"{uuid.uuid4().hex}.{_EXTENSIONS.get(mime, 'png')}"
@@ -152,8 +193,8 @@ class ImageGenerator:
         return {
             "url": f"/generated/{name}",
             "prompt": prompt,
-            "provider": self.provider,
-            "model": self.model,
+            "provider": provider,
+            "model": self.model_for(provider),
             "mime_type": mime,
             "latency_ms": round((time.perf_counter() - started) * 1000),
         }
@@ -162,114 +203,88 @@ class ImageGenerator:
     @staticmethod
     def _check(response: httpx.Response) -> None:
         if response.status_code >= 400:
-            detail = response.text[:300].strip()
-            raise ImageGenerationError(f"HTTP {response.status_code} from image API: {detail}")
+            raise ImageGenerationError(f"HTTP {response.status_code}: {response.text[:300].strip()}")
 
-    @classmethod
-    def _image_bytes(cls, response: httpx.Response) -> tuple[bytes, str]:
-        cls._check(response)
-        mime = response.headers.get("content-type", "").split(";")[0].strip().lower()
-        if not mime.startswith("image/"):
-            raise ImageGenerationError(f"Expected an image but got '{mime or 'unknown'}': {response.text[:200]}")
-        return response.content, mime
+    async def _ollama(self, client: httpx.AsyncClient, prompt: str) -> tuple[bytes, str]:
+        response = await client.post(
+            f"{self.settings.ollama_base_url}/api/generate",
+            json={
+                "model": self.settings.ollama_image_model,
+                "prompt": prompt,
+                "width": 1024,
+                "height": 576,
+                "stream": False,
+                "keep_alive": 0,  # unload right away so the LLM keeps its memory
+            },
+        )
+        if response.status_code == 400 and "not currently supported" in response.text:
+            self.local_unsupported = True  # skip Ollama until the app restarts (e.g. after an upgrade)
+            raise ImageGenerationError(_OLLAMA_UNSUPPORTED)
+        self._check(response)
+        data = response.json().get("image")
+        if not data:
+            raise ImageGenerationError("Ollama returned no image")
+        image = base64.b64decode(data)
+        return image, _sniff_mime(image)
+
+    async def _cloudflare(self, client: httpx.AsyncClient, prompt: str) -> tuple[bytes, str]:
+        s = self.settings
+        url = (
+            f"https://api.cloudflare.com/client/v4/accounts/{s.cloudflare_account_id}"
+            f"/ai/run/{s.cloudflare_image_model}"
+        )
+        response = await client.post(
+            url,
+            headers={"Authorization": f"Bearer {s.cloudflare_api_token}"},
+            json={"prompt": prompt[:2048], "steps": 4},
+        )
+        if response.status_code in (401, 403):
+            raise ImageGenerationError(
+                f"Cloudflare rejected the API token (HTTP {response.status_code}); create one with the "
+                "'Workers AI' permission"
+            )
+        if response.status_code == 429 or (response.status_code >= 400 and "neuron" in response.text.lower()):
+            raise ImageGenerationError(
+                "Cloudflare's free daily allowance (10,000 neurons) is used up; it resets every day"
+            )
+        self._check(response)
+        if response.headers.get("content-type", "").startswith("image/"):
+            return response.content, response.headers["content-type"].split(";")[0]
+        body = response.json()
+        result = body.get("result") if isinstance(body.get("result"), dict) else body
+        data = result.get("image")
+        if not data:
+            raise ImageGenerationError(f"Cloudflare returned no image: {str(body)[:200]}")
+        image = base64.b64decode(data)
+        return image, _sniff_mime(image)
 
     async def _pollinations(self, client: httpx.AsyncClient, prompt: str) -> tuple[bytes, str]:
         seed = random.randint(1, 2**31 - 1)
         token = self.settings.pollinations_token
-        if token:  # current API: FLUX & co., authenticated
+        if token:  # free account key: authenticated API, no watermark
             response = await client.get(
                 f"https://gen.pollinations.ai/image/{quote(prompt, safe='')}",
                 params={"model": self.settings.pollinations_model, "width": 1024, "height": 576, "seed": seed},
                 headers={"Authorization": f"Bearer {token}"},
             )
-        else:  # legacy keyless endpoint: works without sign-up but is rate-limited per IP
+        else:  # keyless endpoint: no sign-up, but rate-limited per IP
             response = await client.get(
                 f"https://image.pollinations.ai/prompt/{quote(prompt, safe='')}",
                 params={"width": 1024, "height": 576, "seed": seed, "nologo": "true", "private": "true"},
             )
             if response.status_code in (401, 402, 403, 429):
-                raise ImageGenerationError(_KEYLESS_LIMITED.format(status=response.status_code))
+                raise ImageGenerationError(
+                    f"keyless tier is rate-limited per IP (HTTP {response.status_code}). {_POLLINATIONS_ADVICE}"
+                )
             if response.status_code >= 500:
-                raise ImageGenerationError(_KEYLESS_DOWN.format(status=response.status_code))
-        return self._image_bytes(response)
-
-    async def _openai(self, client: httpx.AsyncClient, prompt: str) -> tuple[bytes, str]:
-        model = self.settings.openai_image_model
-        payload: dict = {"model": model, "prompt": prompt, "n": 1}
-        if model.startswith("dall-e"):
-            payload.update(size="1792x1024" if model == "dall-e-3" else "1024x1024", response_format="b64_json")
-        else:  # gpt-image-* always returns base64
-            payload.update(size="1536x1024", quality=self.settings.openai_image_quality)
-        response = await client.post(
-            f"{self.settings.openai_base_url}/images/generations",
-            headers={"Authorization": f"Bearer {self.settings.openai_api_key}"},
-            json=payload,
-        )
-        self._check(response)
-        item = response.json()["data"][0]
-        if item.get("b64_json"):
-            return base64.b64decode(item["b64_json"]), "image/png"
-        return self._image_bytes(await client.get(item["url"]))
-
-    async def _gemini(self, client: httpx.AsyncClient, prompt: str) -> tuple[bytes, str]:
-        url = (
-            "https://generativelanguage.googleapis.com/v1/models/"
-            f"{self.settings.gemini_image_model}:generateContent"
-        )
-        config: dict = {"responseModalities": ["TEXT", "IMAGE"]}
-        payload = {
-            "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {**config, "responseFormat": {"image": {"aspectRatio": "16:9"}}},
-        }
-        headers = {"x-goog-api-key": self.settings.gemini_api_key}
-        response = await client.post(url, headers=headers, json=payload)
-        if response.status_code == 400:  # older models may reject the aspect-ratio field: retry without it
-            payload["generationConfig"] = config
-            response = await client.post(url, headers=headers, json=payload)
-        self._check(response)
-        for candidate in response.json().get("candidates", []):
-            for part in candidate.get("content", {}).get("parts", []):
-                inline = part.get("inlineData") or part.get("inline_data")
-                if inline and inline.get("data"):
-                    mime = inline.get("mimeType") or inline.get("mime_type") or "image/png"
-                    return base64.b64decode(inline["data"]), mime
-        raise ImageGenerationError("Gemini returned no image (the prompt may have been filtered)")
-
-    async def _huggingface(self, client: httpx.AsyncClient, prompt: str) -> tuple[bytes, str]:
-        """Hugging Face Inference Providers via the official client.
-
-        HF_IMAGE_PROVIDER=auto lets huggingface_hub route the model to whichever provider
-        serves it (FLUX.1-schnell currently runs on nscale), so no URL is hard-coded here.
-        """
-        from huggingface_hub import InferenceClient
-        from huggingface_hub.errors import HfHubHTTPError
-
-        def run() -> bytes:
-            hf = InferenceClient(
-                provider=self.settings.hf_image_provider,
-                api_key=self.settings.hf_token,
-                timeout=self.settings.image_timeout_s,
-            )
-            image = hf.text_to_image(prompt, model=self.settings.hf_image_model, width=1024, height=576)
-            buffer = io.BytesIO()
-            image.save(buffer, format="PNG")
-            return buffer.getvalue()
-
-        try:
-            return await asyncio.to_thread(run), "image/png"
-        except HfHubHTTPError as exc:
-            status = getattr(exc.response, "status_code", None)
-            if status == 401:
                 raise ImageGenerationError(
-                    "Hugging Face rejected HF_TOKEN (HTTP 401): create a token with the "
-                    "'Make calls to Inference Providers' permission"
-                ) from exc
-            if status == 402:
-                raise ImageGenerationError(
-                    "Hugging Face Inference Providers credits are exhausted (HTTP 402). Free accounts get no "
-                    "monthly credits; buy credits or upgrade to PRO ($2/month included)"
-                ) from exc
-            raise ImageGenerationError(f"Hugging Face error (HTTP {status}): {exc}") from exc
+                    f"keyless tier is best-effort and failed (HTTP {response.status_code}). {_POLLINATIONS_ADVICE}"
+                )
+        self._check(response)
+        mime = response.headers.get("content-type", "").split(";")[0].strip().lower()
+        if not mime.startswith("image/"):
+            raise ImageGenerationError(f"Expected an image but got '{mime or 'unknown'}'")
+        return response.content, mime
 
     def _prune(self) -> None:
         try:
