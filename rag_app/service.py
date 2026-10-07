@@ -123,6 +123,8 @@ class RAGService:
         await self.reindex()
         if self.settings.watch_dataset:
             self._spawn(self._watch_dataset())
+        if self.use_ollama and self.image_generator.mode in ("auto", "ollama"):
+            self._spawn(self._watch_local_image())
         if self.use_ollama and self.index.active is not None:
             self._spawn(self._warm_up(supports_thinking))
 
@@ -152,19 +154,38 @@ class RAGService:
             self.status.update(state="pulling_models", message=label,
                                progress={"model": model, "percent": percent, "status": text})
 
-        models = [s.llm_model, s.embed_model]
-        if s.image_provider == "ollama":  # explicitly chosen local image model: download it too
-            models.append(s.ollama_image_model)
         pulled = await asyncio.to_thread(
-            ensure_models, s.ollama_base_url, models,
+            ensure_models, s.ollama_base_url, [s.llm_model, s.embed_model],
             pull=s.auto_pull_models, on_progress=on_progress,
         )
         if pulled:
             log.info("Downloaded Ollama models: %s", ", ".join(pulled))
-        installed = await asyncio.to_thread(local_models, s.ollama_base_url)
-        self.image_generator.local_installed = normalize(s.ollama_image_model) in installed
-        if self.image_generator.local_installed:
-            log.info("Local image model %s found; it is tried first for illustrations", s.ollama_image_model)
+        await self._refresh_local_image()
+
+    async def _refresh_local_image(self) -> None:
+        """Point the image generator at the first Ollama server that has the image model."""
+        generator = self.image_generator
+        model = normalize(self.settings.ollama_image_model)
+        found = None
+        for url in generator.local_candidates():
+            try:
+                if model in await asyncio.to_thread(local_models, url):
+                    found = url
+                    break
+            except Exception:  # server not running
+                continue
+        if found != generator.local_url:
+            if found:
+                log.info("Local image model %s available at %s; it is tried first", model, found)
+            elif generator.local_url:
+                log.info("Local image server %s is gone; using the free image APIs", generator.local_url)
+            generator.local_url = found
+
+    async def _watch_local_image(self) -> None:
+        """Notice when scripts/ollama_imagegen.sh is started (or stopped) while the app runs."""
+        while True:
+            await asyncio.sleep(30)
+            await self._refresh_local_image()
 
     async def _load_reranker(self) -> None:
         if self.reranker is None or self.reranker.ready:

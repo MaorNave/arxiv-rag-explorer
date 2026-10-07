@@ -1,5 +1,6 @@
 import json
 import time
+from dataclasses import replace
 
 import pytest
 from fastapi.testclient import TestClient
@@ -116,3 +117,28 @@ def test_service_rejects_queries_before_the_index_exists(settings, embeddings):
     client = TestClient(app)  # lifespan not started -> nothing indexed
     assert client.post("/answer", json={"query": "anything"}).status_code == 503
     assert client.post("/stream", json={"query": "anything"}).status_code == 503
+
+
+def test_service_discovers_the_local_image_server(settings, embeddings, monkeypatch):
+    import asyncio
+
+    from rag_app import service as service_module
+    from rag_app.images import IMAGEGEN_URL
+
+    servers = {IMAGEGEN_URL: {"x/flux2-klein:4b"}, settings.ollama_base_url: {"qwen3.5:4b"}}
+
+    def fake_local_models(url):
+        if url not in servers:
+            raise ConnectionError(url)
+        return servers[url]
+
+    monkeypatch.setattr(service_module, "local_models", fake_local_models)
+    service = RAGService(replace(settings, image_provider="auto"), embeddings=embeddings, llm=fake_llm(), use_ollama=False)
+    asyncio.run(service._refresh_local_image())
+    assert service.image_generator.local_url == IMAGEGEN_URL
+    assert service.image_generator.runs_after_answer
+
+    del servers[IMAGEGEN_URL]  # the dedicated server was stopped
+    asyncio.run(service._refresh_local_image())
+    assert service.image_generator.local_url is None
+    assert service.image_generator.chain() == ["pollinations"]

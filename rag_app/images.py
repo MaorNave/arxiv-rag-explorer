@@ -3,11 +3,12 @@
 With IMAGE_PROVIDER=auto (default) the providers below are tried in this order, and if
 one fails the next one is used:
 
-    ollama        local and free: OLLAMA_IMAGE_MODEL (x/flux2-klein:4b) served by the same
-                  Ollama that runs Qwen. Used when the model is installed and the Ollama
-                  version can generate images (experimental image generation was temporarily
-                  removed in Ollama 0.32.6; this switches on again by itself once it returns).
-                  Runs *after* the answer so it never competes with the LLM for the GPU.
+    ollama        local and free: OLLAMA_IMAGE_MODEL (x/flux2-klein:4b) on an Ollama server that
+                  can generate images. Ollama removed image generation in 0.32.6 ("continue
+                  using 0.32.5"), so scripts/ollama_imagegen.sh runs a dedicated 0.32.5 server
+                  on port 11435 next to the main Ollama; the main server is used as soon as it
+                  supports images again. Runs *after* the answer so it never competes with the
+                  LLM for the GPU.
     cloudflare    free external API: Cloudflare Workers AI's free plan includes 10,000
                   neurons per day (about 170 FLUX.1 schnell images). Needs a free account:
                   CLOUDFLARE_ACCOUNT_ID + CLOUDFLARE_API_TOKEN.
@@ -50,8 +51,9 @@ _POLLINATIONS_ADVICE = (
 )
 _OLLAMA_UNSUPPORTED = (
     "This Ollama version cannot generate images (experimental image generation was removed in "
-    "Ollama 0.32.6); using the free external APIs instead"
+    "Ollama 0.32.6); run scripts/ollama_imagegen.sh for local images, using the free APIs meanwhile"
 )
+IMAGEGEN_URL = "http://127.0.0.1:11435"  # where scripts/ollama_imagegen.sh serves Ollama 0.32.5
 
 
 class ImageGenerationError(RuntimeError):
@@ -89,8 +91,16 @@ class ImageGenerator:
         self.mode = settings.image_provider
         self.output_dir: Path = settings.images_dir
         self._transport = transport  # injectable for offline tests
-        self.local_installed = False  # set by the service once Ollama has been checked
-        self.local_unsupported = False  # set when this Ollama version refuses image generation
+        self.local_url: str | None = None  # Ollama server that has the image model (set by the service)
+        self.unsupported_urls: set[str] = set()  # Ollama servers that refused image generation
+
+    def local_candidates(self) -> list[str]:
+        """Ollama servers to look for the local image model on, in order of preference."""
+        if self.settings.ollama_image_base_url:
+            urls = [self.settings.ollama_image_base_url]
+        else:
+            urls = [IMAGEGEN_URL, self.settings.ollama_base_url]
+        return [u for u in dict.fromkeys(urls) if u not in self.unsupported_urls]
 
     # ------------------------------------------------------------------ provider selection
     @property
@@ -104,7 +114,7 @@ class ImageGenerator:
         if self.mode != "auto":
             return [self.mode] if self.mode in PROVIDERS else []
         chain = []
-        if self.local_installed and not self.local_unsupported:
+        if self.local_url and self.local_url not in self.unsupported_urls:
             chain.append("ollama")
         if self.cloudflare_configured:
             chain.append("cloudflare")
@@ -129,8 +139,8 @@ class ImageGenerator:
             return f"Unknown IMAGE_PROVIDER '{self.mode}' (use auto, ollama, cloudflare, pollinations or none)"
         if self.mode == "cloudflare" and not self.cloudflare_configured:
             return "Set CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN to use Cloudflare Workers AI"
-        if self.mode == "ollama" and self.local_unsupported:
-            return _OLLAMA_UNSUPPORTED.split(";")[0]
+        if self.mode == "ollama" and not self.local_url:
+            return f"No Ollama server with {self.settings.ollama_image_model} that can generate images was found"
         return None
 
     @property
@@ -155,6 +165,7 @@ class ImageGenerator:
             "keyless": provider == "pollinations" and not self.settings.pollinations_token,
             "chain": [PROVIDER_LABELS[p] for p in self.chain()],
             "local": provider == "ollama",
+            "local_url": self.local_url,
             "runs_after_answer": self.runs_after_answer,
             "available": self.available,
             "reason": self.unavailable_reason,
@@ -206,8 +217,11 @@ class ImageGenerator:
             raise ImageGenerationError(f"HTTP {response.status_code}: {response.text[:300].strip()}")
 
     async def _ollama(self, client: httpx.AsyncClient, prompt: str) -> tuple[bytes, str]:
+        url = self.local_url
+        if not url:
+            raise ImageGenerationError("No local Ollama image server is available")
         response = await client.post(
-            f"{self.settings.ollama_base_url}/api/generate",
+            f"{url}/api/generate",
             json={
                 "model": self.settings.ollama_image_model,
                 "prompt": prompt,
@@ -218,7 +232,8 @@ class ImageGenerator:
             },
         )
         if response.status_code == 400 and "not currently supported" in response.text:
-            self.local_unsupported = True  # skip Ollama until the app restarts (e.g. after an upgrade)
+            self.unsupported_urls.add(url)  # never ask this server again during this run
+            self.local_url = None
             raise ImageGenerationError(_OLLAMA_UNSUPPORTED)
         self._check(response)
         data = response.json().get("image")

@@ -92,6 +92,10 @@ button stops it.
 **Ollama runs separately.** Stopping the app doesn't stop Ollama. Idle models are unloaded automatically after 30
 minutes (`LLM_KEEP_ALIVE`); to free the memory right away run `ollama stop qwen3.5:4b`, or quit the Ollama app.
 
+**Optional local image server (macOS):** start it with `./scripts/ollama_imagegen.sh` and stop it with
+`./scripts/ollama_imagegen.sh stop` (see [Local images on macOS](#local-images-on-macos-flux2-klein)). The app works
+with or without it.
+
 ---
 
 ## Assignment checklist
@@ -287,7 +291,7 @@ order, and if one fails the next one is used automatically:
 
 | # | Provider | Cost | Setup |
 |---|---|---|---|
-| 1 | **Local model via Ollama** (`x/flux2-klein:4b`, FLUX.2 [klein], Apache-2.0) | free, offline | `ollama pull x/flux2-klein:4b` (5.7 GB), or `python -m rag_app.setup_models --image` |
+| 1 | **Local model via Ollama** (`x/flux2-klein:4b`, FLUX.2 [klein], Apache-2.0) | free, offline | macOS: `./scripts/ollama_imagegen.sh` (see [below](#local-images-on-macos-flux2-klein)) |
 | 2 | **Cloudflare Workers AI** (FLUX.1 schnell) | free plan: 10,000 neurons/day ≈ 170 images/day | free Cloudflare account → *AI → Workers AI* → create an API token with the *Workers AI* permission, then set `CLOUDFLARE_ACCOUNT_ID` and `CLOUDFLARE_API_TOKEN` |
 | 3 | **Pollinations.ai** (FLUX) | free | nothing (keyless, rate-limited and watermarked); a free account key in `POLLINATIONS_TOKEN` removes the watermark |
 
@@ -301,11 +305,30 @@ How it is wired:
 - **Force one provider** with `IMAGE_PROVIDER=ollama|cloudflare|pollinations`, or disable the feature with
   `IMAGE_PROVIDER=none`. Models: `OLLAMA_IMAGE_MODEL`, `CLOUDFLARE_IMAGE_MODEL`, `POLLINATIONS_MODEL`.
 
-> **Local generation status (October 2026):** Ollama introduced local image generation in January 2026, but
-> **temporarily removed it in version 0.32.6** (it answers *"image generation models are not currently
-> supported"*). The app detects this on the first request and falls back to the free APIs. Once Ollama restores
-> the feature, local generation switches on again after an upgrade, with no code change. Note that FLUX.2 klein
-> 4B needs a lot of memory; on 16 GB machines Ollama may refuse it, and the fallback handles that too.
+### Local images on macOS (FLUX.2 klein)
+
+Ollama added local image generation in January 2026, then **temporarily removed it in 0.32.6**, and its release
+notes say to *"continue using 0.32.5 for image generation support"*. Downgrading your main Ollama would hold back
+Qwen, so `scripts/ollama_imagegen.sh` runs **Ollama 0.32.5 as a second, dedicated image server** next to it:
+
+```bash
+./scripts/ollama_imagegen.sh            # first run installs, later runs just start it
+./scripts/ollama_imagegen.sh status
+./scripts/ollama_imagegen.sh stop
+./scripts/ollama_imagegen.sh uninstall  # removes ~/.ollama-imagegen
+```
+
+- **Your regular Ollama is untouched.** 0.32.5 is installed into `~/.ollama-imagegen` (146 MB download), listens on
+  `127.0.0.1:11435`, and has its own model folder. If your regular Ollama already has `x/flux2-klein:4b`, its files
+  are reused as copy-on-write clones (no extra disk space); otherwise the model is downloaded (5.7 GB).
+- **Zero configuration.** The app looks for the image server every 30 s, with no restart and no `.env` change
+  needed. While it runs, images are generated locally; when it's stopped, the free APIs take over.
+- **The answer is not slowed down.** Local images start once the answer is complete. Measured on an M1 Pro with
+  16 GB: the answer took 18 s as usual, then the 1024×576 image took ~40 s, peaking at ~7.6 GB of memory.
+- When Ollama restores image generation in a future release, just stop the script: the app then uses your main
+  Ollama. To point it at another server, set `OLLAMA_IMAGE_BASE_URL`.
+
+On Linux and Windows the script isn't needed: the app uses the free external APIs.
 
 **Why no Gemini, OpenAI or Hugging Face?** They aren't free for image generation through their APIs (checked
 October 2026). Gemini's "Nano Banana" models have no free API tier: they're free only inside the Gemini / AI Studio
@@ -398,7 +421,7 @@ Run it yourself (stop the web app first so the two don't compete for the GPU):
 
 ```bash
 pip install -r requirements-dev.txt
-pytest -q          # 47 tests, ~3 s, fully offline
+pytest -q          # 49 tests, ~3 s, fully offline
 ```
 
 The suite never touches Ollama or the network: it uses deterministic bag-of-words embeddings and LangChain's
@@ -442,6 +465,7 @@ The suite never touches Ollama or the network: it uses deterministic bag-of-word
 │   └── static/              # the web UI (vanilla HTML/CSS/JS, no build step)
 ├── scripts/
 │   ├── setup.sh / setup.ps1 # one-shot installers
+│   ├── ollama_imagegen.sh   # local FLUX.2 klein image server (Ollama 0.32.5, macOS)
 │   └── eval_retrieval.py    # retrieval benchmark
 └── tests/                   # offline pytest suite
 ```
@@ -486,7 +510,7 @@ The suite never touches Ollama or the network: it uses deterministic bag-of-word
 | Out of memory / very slow on CPU | Use a smaller `LLM_MODEL` (see [hardware](#models-and-hardware)), lower `LLM_NUM_CTX` to `4096`, or set `QUERY_REWRITE=false`. |
 | `Reranker unavailable` in the logs | The first run couldn't reach Hugging Face. The app keeps working without reranking; it retries on the next start. Disable it with `RERANKER_MODEL=none`. |
 | Image: *keyless tier is rate-limited / failed* | The keyless tier is best-effort (rate limits, occasional outages). Add a free `POLLINATIONS_TOKEN` or a free Cloudflare Workers AI account (see [image generation](#bonus-image-generation)). |
-| Image: *This Ollama version cannot generate images* | Expected with Ollama ≥ 0.32.6, which temporarily removed image generation; the app falls back to the free APIs automatically. |
+| Image: *This Ollama version cannot generate images* | Expected with Ollama ≥ 0.32.6, which temporarily removed image generation. On macOS run `./scripts/ollama_imagegen.sh` for local images; otherwise the app falls back to the free APIs automatically. |
 | Port 8080 is busy | `PORT=9000 python main.py` |
 
 ---

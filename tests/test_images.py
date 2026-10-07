@@ -8,7 +8,7 @@ from dataclasses import replace
 import httpx
 import pytest
 
-from rag_app.images import ImageGenerationError, ImageGenerator
+from rag_app.images import IMAGEGEN_URL, ImageGenerationError, ImageGenerator
 
 PNG = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII="
@@ -19,7 +19,7 @@ CLOUDFLARE = {"cloudflare_account_id": "acc", "cloudflare_api_token": "cf_token"
 
 def generator(settings, handler, local=False, **overrides):
     gen = ImageGenerator(replace(settings, **overrides), transport=httpx.MockTransport(handler))
-    gen.local_installed = local
+    gen.local_url = IMAGEGEN_URL if local else None
     return gen
 
 
@@ -33,7 +33,7 @@ def test_auto_chain_prefers_local_then_free_apis(settings):
     assert ImageGenerator(auto).chain() == ["pollinations"]
     assert ImageGenerator(replace(auto, **CLOUDFLARE)).chain() == ["cloudflare", "pollinations"]
     gen = ImageGenerator(replace(auto, **CLOUDFLARE))
-    gen.local_installed = True
+    gen.local_url = IMAGEGEN_URL
     assert gen.chain() == ["ollama", "cloudflare", "pollinations"] and gen.runs_after_answer
     assert gen.describe()["chain"] == ["Ollama (local)", "Cloudflare Workers AI", "Pollinations.ai"]
 
@@ -45,10 +45,19 @@ def test_explicit_and_disabled_providers(settings):
     assert ImageGenerator(replace(settings, image_provider="pollinations")).chain() == ["pollinations"]
 
 
+def test_local_candidates(settings):
+    gen = ImageGenerator(settings)
+    assert gen.local_candidates() == [IMAGEGEN_URL, settings.ollama_base_url]  # dedicated 0.32.5 server first
+    gen.unsupported_urls.add(settings.ollama_base_url)
+    assert gen.local_candidates() == [IMAGEGEN_URL]
+    explicit = ImageGenerator(replace(settings, ollama_image_base_url="http://gpu-box:11434"))
+    assert explicit.local_candidates() == ["http://gpu-box:11434"]
+
+
 def test_local_ollama_generates_after_the_answer(settings):
     def handler(request):
         body = json.loads(request.content)
-        assert request.url.path == "/api/generate" and body["model"] == "x/flux2-klein:4b"
+        assert str(request.url) == f"{IMAGEGEN_URL}/api/generate" and body["model"] == "x/flux2-klein:4b"
         assert body["stream"] is False and body["keep_alive"] == 0 and (body["width"], body["height"]) == (1024, 576)
         return httpx.Response(200, json={"image": base64.b64encode(PNG).decode(), "done": True})
 

@@ -50,7 +50,10 @@ def _env_optional_float(name: str) -> float | None:
 
 def _ollama_base_url() -> str:
     """OLLAMA_BASE_URL, else Ollama's own OLLAMA_HOST, normalised to a full URL."""
-    raw = _env("OLLAMA_BASE_URL") or _env("OLLAMA_HOST") or "http://127.0.0.1:11434"
+    return _normalize_ollama_url(_env("OLLAMA_BASE_URL") or _env("OLLAMA_HOST") or "http://127.0.0.1:11434")
+
+
+def _normalize_ollama_url(raw: str) -> str:
     if "://" not in raw:
         raw = f"http://{raw}"
     scheme, rest = raw.split("://", 1)
@@ -110,6 +113,8 @@ class Settings:
     image_timeout_s: float = 120.0
     local_image_timeout_s: float = 600.0
     ollama_image_model: str = "x/flux2-klein:4b"
+    # None = auto: the dedicated image server from scripts/ollama_imagegen.sh, then the main Ollama
+    ollama_image_base_url: str | None = None
     cloudflare_account_id: str | None = None
     cloudflare_api_token: str | None = None
     cloudflare_image_model: str = "@cf/black-forest-labs/flux-1-schnell"
@@ -185,6 +190,9 @@ class Settings:
             image_timeout_s=_env_float("IMAGE_TIMEOUT_S", cls.image_timeout_s),
             local_image_timeout_s=_env_float("LOCAL_IMAGE_TIMEOUT_S", cls.local_image_timeout_s),
             ollama_image_model=_env("OLLAMA_IMAGE_MODEL", cls.ollama_image_model),
+            ollama_image_base_url=(
+                _normalize_ollama_url(_env("OLLAMA_IMAGE_BASE_URL")) if _env("OLLAMA_IMAGE_BASE_URL") else None
+            ),
             cloudflare_account_id=_env("CLOUDFLARE_ACCOUNT_ID"),
             cloudflare_api_token=_env("CLOUDFLARE_API_TOKEN"),
             cloudflare_image_model=_env("CLOUDFLARE_IMAGE_MODEL", cls.cloudflare_image_model),
