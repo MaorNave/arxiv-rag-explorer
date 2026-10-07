@@ -1,0 +1,211 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>arXiv RAG Explorer</title>
+  <meta name="description" content="Grounded answers over research abstracts, fully local with LangGraph, Ollama and Qwen.">
+  <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/static/app.css">
+  <script>
+    // Apply the saved/system theme before first paint to avoid a flash.
+    (function () {
+      var t = null;
+      try { t = localStorage.getItem("rag-theme"); } catch (e) {}
+      if (!t) t = matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+      document.documentElement.dataset.theme = t;
+    })();
+  </script>
+</head>
+<body>
+  <a class="skip-link" href="#query">Skip to the question box</a>
+
+  <header class="topbar">
+    <div class="topbar-inner">
+      <a class="brand" href="/" aria-label="arXiv RAG Explorer home">
+        <span class="brand-mark" aria-hidden="true"><i data-icon="book"></i></span>
+        <span class="brand-text">
+          <strong>arXiv RAG Explorer</strong>
+          <small>LangGraph · Ollama · Qwen</small>
+        </span>
+      </a>
+      <div class="topbar-actions">
+        <button class="status-pill" id="status-pill" type="button" data-state="starting" aria-live="polite" title="System status: open dataset details">
+          <span class="dot" aria-hidden="true"></span><span id="status-text">Starting…</span>
+        </button>
+        <button class="icon-btn" id="btn-dataset" type="button" title="Dataset & index"><i data-icon="database"></i><span class="hide-sm">Dataset</span></button>
+        <button class="icon-btn" id="btn-history" type="button" title="History"><i data-icon="history"></i><span class="hide-sm">History</span></button>
+        <a class="icon-btn" href="/docs" target="_blank" rel="noopener" title="Interactive API docs (/answer, /stream)"><i data-icon="code"></i><span class="hide-sm">API</span></a>
+        <button class="icon-btn" id="btn-theme" type="button" title="Toggle dark mode" aria-label="Toggle dark mode"><i data-icon="moon"></i></button>
+      </div>
+    </div>
+  </header>
+
+  <main class="page">
+    <section class="hero">
+      <h1>Ask the research literature</h1>
+      <p class="lead" id="hero-lead">Grounded answers with citations from a collection of research abstracts, generated 100% locally.</p>
+
+      <form class="ask-card" id="ask-form" autocomplete="off">
+        <label class="sr-only" for="query">Your question</label>
+        <textarea id="query" name="query" rows="3" maxlength="2000"
+          placeholder="e.g. How can reward models combine human feedback with verifiable rewards?"></textarea>
+        <div class="ask-toolbar">
+          <div class="ask-options">
+            <label class="range" title="How many abstracts to retrieve as context">
+              <span>Sources <output id="topk-out">5</output></span>
+              <input id="topk" type="range" min="1" max="10" value="5">
+            </label>
+            <label class="switch" id="image-switch" title="Bonus: illustrate the answer with an external image API">
+              <input id="gen-image" type="checkbox">
+              <span class="track" aria-hidden="true"><span class="thumb"></span></span>
+              <span class="switch-label"><i data-icon="image"></i>Generate image <small id="image-provider"></small></span>
+            </label>
+          </div>
+          <div class="ask-buttons">
+            <span class="kbd-hint hide-sm" title="Enter to ask · Shift+Enter for a new line"><kbd>↵</kbd></span>
+            <button class="btn btn-ghost hidden" id="btn-stop" type="button"><i data-icon="stop"></i>Stop</button>
+            <button class="btn btn-primary" id="btn-ask" type="submit" disabled><i data-icon="sparkles"></i><span>Answer</span></button>
+          </div>
+        </div>
+      </form>
+
+      <div class="examples" id="examples" aria-label="Example questions"></div>
+    </section>
+
+    <!-- Startup / indexing progress -->
+    <section class="boot-card card hidden" id="boot-card" aria-live="polite">
+      <div class="boot-head">
+        <span class="spinner" aria-hidden="true"></span>
+        <div>
+          <h2 id="boot-title">Getting things ready</h2>
+          <p id="boot-message" class="muted">Starting up…</p>
+        </div>
+      </div>
+      <div class="progress"><span id="boot-bar"></span></div>
+      <ol class="boot-steps" id="boot-steps">
+        <li data-step="ollama">Connect to Ollama</li>
+        <li data-step="models">Download models</li>
+        <li data-step="index">Build or load the vector index</li>
+        <li data-step="ready">Ready to answer</li>
+      </ol>
+    </section>
+
+    <!-- Pipeline progress -->
+    <section class="pipeline hidden" id="pipeline" aria-label="Pipeline progress">
+      <div class="step" data-step="understand"><span class="step-icon"><i data-icon="lightbulb"></i></span><span class="step-text"><b>Understand</b><small>query plan</small></span></div>
+      <div class="step-line"></div>
+      <div class="step" data-step="retrieve"><span class="step-icon"><i data-icon="search"></i></span><span class="step-text"><b>Retrieve</b><small>hybrid search</small></span></div>
+      <div class="step-line"></div>
+      <div class="step" data-step="rerank"><span class="step-icon"><i data-icon="sort"></i></span><span class="step-text"><b>Rerank</b><small>cross-encoder</small></span></div>
+      <div class="step-line"></div>
+      <div class="step" data-step="generate"><span class="step-icon"><i data-icon="pen"></i></span><span class="step-text"><b>Generate</b><small>grounded answer</small></span></div>
+      <div class="step-line image-only"></div>
+      <div class="step image-only" data-step="image"><span class="step-icon"><i data-icon="image"></i></span><span class="step-text"><b>Illustrate</b><small>in parallel</small></span></div>
+    </section>
+
+    <!-- Results -->
+    <section class="results hidden" id="results">
+      <div class="col-main">
+        <article class="card answer-card" id="answer-card">
+          <header class="card-head">
+            <h2><i data-icon="sparkles"></i>Answer</h2>
+            <div class="card-actions">
+              <button class="icon-btn small" id="btn-copy-answer" type="button" title="Copy answer"><i data-icon="copy"></i></button>
+            </div>
+          </header>
+          <details class="reasoning hidden" id="reasoning">
+            <summary>Model reasoning</summary>
+            <pre id="reasoning-text"></pre>
+          </details>
+          <div class="answer markdown" id="answer" aria-live="polite"></div>
+          <div class="metrics" id="metrics"></div>
+        </article>
+
+        <article class="card hidden" id="citations-card">
+          <header class="card-head"><h2><i data-icon="file"></i>Citations</h2><span class="count" id="citations-count"></span></header>
+          <ol class="citations" id="citations"></ol>
+        </article>
+
+        <article class="card hidden" id="image-card">
+          <header class="card-head"><h2><i data-icon="image"></i>Illustration</h2><span class="muted small" id="image-meta"></span></header>
+          <div class="image-body" id="image-body"></div>
+        </article>
+
+        <article class="card hidden" id="analysis-card">
+          <header class="card-head"><h2><i data-icon="lightbulb"></i>How the question was understood</h2><span class="muted small" id="analysis-meta"></span></header>
+          <div class="analysis" id="analysis"></div>
+        </article>
+      </div>
+
+      <aside class="col-side">
+        <article class="card context-card">
+          <header class="card-head"><h2><i data-icon="layers"></i>Retrieved context</h2><span class="count" id="context-count"></span></header>
+          <div class="sources" id="sources"></div>
+        </article>
+      </aside>
+
+      <details class="card raw-json" id="raw-json">
+        <summary><span><i data-icon="braces"></i>Raw JSON response</span>
+          <span class="card-actions">
+            <button class="icon-btn small" id="btn-copy-json" type="button" title="Copy JSON"><i data-icon="copy"></i></button>
+            <button class="icon-btn small" id="btn-download-json" type="button" title="Download JSON"><i data-icon="download"></i></button>
+          </span>
+        </summary>
+        <pre class="json" id="json"></pre>
+      </details>
+    </section>
+
+    <!-- Empty state -->
+    <section class="features" id="features">
+      <div class="feature"><span class="feature-icon"><i data-icon="shield"></i></span><h3>Private &amp; local</h3><p>Indexing, retrieval and generation run on your machine through Ollama. No data leaves it.</p></div>
+      <div class="feature"><span class="feature-icon"><i data-icon="search"></i></span><h3>Hybrid retrieval + reranking</h3><p>Dense vectors (Chroma) and BM25 (SQLite FTS5) fused with Reciprocal Rank Fusion, then re-scored by a local cross-encoder.</p></div>
+      <div class="feature"><span class="feature-icon"><i data-icon="file"></i></span><h3>Grounded &amp; cited</h3><p>Every claim cites the abstracts it comes from; the model says so when the context is not enough.</p></div>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <span id="footer-models">LangGraph · LangChain · Ollama · Chroma · SQLite FTS5</span>
+    <span>API: <code>POST /answer</code> · <code>POST /stream</code> · <a href="/docs" target="_blank" rel="noopener">/docs</a></span>
+  </footer>
+
+  <!-- History drawer -->
+  <div class="drawer-backdrop hidden" id="drawer-backdrop"></div>
+  <aside class="drawer" id="history-drawer" aria-hidden="true" aria-label="History">
+    <header class="drawer-head">
+      <h2><i data-icon="history"></i>History</h2>
+      <div class="card-actions">
+        <button class="icon-btn small" id="btn-clear-history" type="button" title="Clear history"><i data-icon="trash"></i></button>
+        <button class="icon-btn small" id="btn-close-history" type="button" title="Close"><i data-icon="x"></i></button>
+      </div>
+    </header>
+    <ul class="history-list" id="history-list"></ul>
+  </aside>
+
+  <!-- Dataset dialog -->
+  <dialog class="modal" id="dataset-modal" aria-labelledby="dataset-title">
+    <form method="dialog" class="modal-inner">
+      <header class="modal-head">
+        <h2 id="dataset-title"><i data-icon="database"></i>Dataset &amp; index</h2>
+        <button class="icon-btn small" value="close" title="Close"><i data-icon="x"></i></button>
+      </header>
+      <div id="dataset-details" class="dataset-details"></div>
+      <div class="dropzone" id="dropzone">
+        <i data-icon="upload"></i>
+        <p><b>Replace the dataset</b>: drop a <code>.jsonl</code> file here or <label class="link" for="file-input">browse</label>.</p>
+        <p class="muted small">Each line: <code>{"id": …, "title": …, "abstract": …}</code>. The current index is discarded and rebuilt.</p>
+        <input id="file-input" type="file" accept=".jsonl,application/jsonl,application/x-ndjson" hidden>
+        <div class="progress hidden" id="upload-progress"><span></span></div>
+      </div>
+      <footer class="modal-foot">
+        <button class="btn btn-ghost" id="btn-reindex" type="button"><i data-icon="refresh"></i>Rebuild index</button>
+        <button class="btn btn-primary" value="close">Done</button>
+      </footer>
+    </form>
+  </dialog>
+
+  <div class="toasts" id="toasts" aria-live="assertive"></div>
+
+  <script src="/static/app.js" defer></script>
+</body>
+</html>

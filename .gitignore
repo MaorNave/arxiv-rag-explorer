@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+.venv/
+venv/
+
+# Runtime data: vector index, downloaded models, uploads, generated images, eval caches
+storage/
+
+# Secrets (copy .env.example to .env)
+.env
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+
+# The assignment brief is not part of the published project
+GenAIHomeAssignment.pdf
