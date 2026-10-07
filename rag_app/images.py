@@ -6,9 +6,10 @@ IMAGE_PROVIDER selects the backend:
     pollinations  POLLINATIONS_TOKEN -> FLUX via gen.pollinations.ai (free key at
                   https://enter.pollinations.ai); without a key the keyless legacy
                   endpoint is used, which is rate-limited per IP
-    openai        OPENAI_API_KEY, gpt-image-1 / dall-e-3
-    gemini        GEMINI_API_KEY, gemini-2.5-flash-image
-    huggingface   HF_TOKEN, FLUX.1-schnell via the HF Inference API
+    openai        OPENAI_API_KEY, gpt-image-2.5-flare (any OpenAI image model)
+    gemini        GEMINI_API_KEY, gemini-nano-banana-2.1 ("Nano Banana")
+    huggingface   HF_TOKEN, any HF text-to-image model (FLUX.1-schnell by default), routed by
+                  huggingface_hub to whichever Inference Provider serves it
     none          feature disabled
 
 Images are generated in a parallel LangGraph branch, so they never delay the text
@@ -17,7 +18,9 @@ answer. The bytes are stored under STORAGE_DIR/images and served at /generated/.
 
 from __future__ import annotations
 
+import asyncio
 import base64
+import io
 import logging
 import random
 import time
@@ -210,14 +213,19 @@ class ImageGenerator:
 
     async def _gemini(self, client: httpx.AsyncClient, prompt: str) -> tuple[bytes, str]:
         url = (
-            "https://generativelanguage.googleapis.com/v1beta/models/"
+            "https://generativelanguage.googleapis.com/v1/models/"
             f"{self.settings.gemini_image_model}:generateContent"
         )
+        config: dict = {"responseModalities": ["TEXT", "IMAGE"]}
         payload = {
             "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {"responseModalities": ["TEXT", "IMAGE"], "imageConfig": {"aspectRatio": "16:9"}},
+            "generationConfig": {**config, "responseFormat": {"image": {"aspectRatio": "16:9"}}},
         }
-        response = await client.post(url, headers={"x-goog-api-key": self.settings.gemini_api_key}, json=payload)
+        headers = {"x-goog-api-key": self.settings.gemini_api_key}
+        response = await client.post(url, headers=headers, json=payload)
+        if response.status_code == 400:  # older models may reject the aspect-ratio field: retry without it
+            payload["generationConfig"] = config
+            response = await client.post(url, headers=headers, json=payload)
         self._check(response)
         for candidate in response.json().get("candidates", []):
             for part in candidate.get("content", {}).get("parts", []):
@@ -228,13 +236,40 @@ class ImageGenerator:
         raise ImageGenerationError("Gemini returned no image (the prompt may have been filtered)")
 
     async def _huggingface(self, client: httpx.AsyncClient, prompt: str) -> tuple[bytes, str]:
-        url = f"https://router.huggingface.co/hf-inference/models/{self.settings.hf_image_model}"
-        response = await client.post(
-            url,
-            headers={"Authorization": f"Bearer {self.settings.hf_token}", "Accept": "image/png"},
-            json={"inputs": prompt, "parameters": {"width": 1024, "height": 576}},
-        )
-        return self._image_bytes(response)
+        """Hugging Face Inference Providers via the official client.
+
+        HF_IMAGE_PROVIDER=auto lets huggingface_hub route the model to whichever provider
+        serves it (FLUX.1-schnell currently runs on nscale), so no URL is hard-coded here.
+        """
+        from huggingface_hub import InferenceClient
+        from huggingface_hub.errors import HfHubHTTPError
+
+        def run() -> bytes:
+            hf = InferenceClient(
+                provider=self.settings.hf_image_provider,
+                api_key=self.settings.hf_token,
+                timeout=self.settings.image_timeout_s,
+            )
+            image = hf.text_to_image(prompt, model=self.settings.hf_image_model, width=1024, height=576)
+            buffer = io.BytesIO()
+            image.save(buffer, format="PNG")
+            return buffer.getvalue()
+
+        try:
+            return await asyncio.to_thread(run), "image/png"
+        except HfHubHTTPError as exc:
+            status = getattr(exc.response, "status_code", None)
+            if status == 401:
+                raise ImageGenerationError(
+                    "Hugging Face rejected HF_TOKEN (HTTP 401): create a token with the "
+                    "'Make calls to Inference Providers' permission"
+                ) from exc
+            if status == 402:
+                raise ImageGenerationError(
+                    "Hugging Face Inference Providers credits are exhausted (HTTP 402). Free accounts get no "
+                    "monthly credits; buy credits or upgrade to PRO ($2/month included)"
+                ) from exc
+            raise ImageGenerationError(f"Hugging Face error (HTTP {status}): {exc}") from exc
 
     def _prune(self) -> None:
         try:

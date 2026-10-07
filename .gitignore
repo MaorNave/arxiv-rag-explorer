@@ -12,6 +12,9 @@ storage/
 # Secrets (copy .env.example to .env)
 .env
 
+# Logs of background runs (nohup ... > rag.log)
+*.log
+
 # IDE / OS
 .idea/
 .vscode/

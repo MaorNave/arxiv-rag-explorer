@@ -17,6 +17,7 @@ optional illustration from an external image API.
 ## Contents
 
 - [Quick start](#quick-start)
+- [Start, stop and restart](#start-stop-and-restart)
 - [Assignment checklist](#assignment-checklist)
 - [Architecture](#architecture)
 - [Using another dataset](#using-another-dataset)
@@ -67,6 +68,29 @@ You can also pre-download the models on their own with `python -m rag_app.setup_
 > **Why aren't the models in `requirements.txt`?** pip can only install Python packages. Model weights are
 > downloaded by the `ollama` client (listed in `requirements.txt`) the first time the app starts, so
 > `pip install -r requirements.txt` + `python main.py` is the whole minimal installation.
+
+---
+
+## Start, stop and restart
+
+The index, downloaded models and settings persist on disk, so stopping is safe and a restart takes only a few
+seconds (no re-indexing, no re-downloading). Run the commands from the project folder.
+
+| Action | macOS / Linux | Windows (PowerShell) |
+|---|---|---|
+| Start | `source .venv/bin/activate && python main.py` | `.venv\Scripts\python.exe main.py` |
+| Stop it (started in a terminal) | <kbd>Ctrl</kbd>+<kbd>C</kbd> in that terminal | <kbd>Ctrl</kbd>+<kbd>C</kbd> |
+| Start in the background | `nohup .venv/bin/python main.py > rag.log 2>&1 &` | `Start-Process .venv\Scripts\python.exe main.py -WindowStyle Hidden` |
+| Stop it (running in the background) | `kill $(lsof -tiTCP:8080 -sTCP:LISTEN)` | `Stop-Process -Id (Get-NetTCPConnection -LocalPort 8080 -State Listen).OwningProcess` |
+| Is it running? | `curl -s http://127.0.0.1:8080/health` | `Invoke-RestMethod http://127.0.0.1:8080/health` |
+
+If you started the app with another `PORT`, use that number instead of `8080` in the stop and health commands.
+
+**PyCharm:** select the project's `.venv` as the interpreter, open `main.py` and press ▶ *Run*; the ■ *Stop*
+button stops it.
+
+**Ollama runs separately.** Stopping the app doesn't stop Ollama. Idle models are unloaded automatically after 30
+minutes (`LLM_KEEP_ALIVE`); to free the memory right away run `ollama stop qwen3.5:4b`, or quit the Ollama app.
 
 ---
 
@@ -265,18 +289,50 @@ contains `images: [{url, prompt, provider, model, latency_ms}]` (files are serve
 deterministically from the query plan (topic + keywords), without an extra LLM call that would compete with the
 answer for the local model.
 
-Configure it in `.env` (copy `.env.example`). With `IMAGE_PROVIDER=auto` (default), the first configured provider wins:
+### Choosing the provider and the model
 
-| Provider | Setting | Notes |
+Two settings in `.env` (copy `.env.example`) decide what draws the picture. Restart the app after changing them;
+the UI shows the active provider next to the *Generate image* switch.
+
+1. **Provider:** `IMAGE_PROVIDER=auto|pollinations|openai|gemini|huggingface|none`. With `auto` (the default),
+   the first provider that has a key wins, in the order OpenAI → Gemini → Pollinations (with key) → Hugging Face.
+   With no key at all, Pollinations' keyless tier is used.
+2. **Model:** each provider has its own model setting.
+
+| Provider | Key | Model setting (default) | Other models |
+|---|---|---|---|
+| Pollinations.ai | `POLLINATIONS_TOKEN` | `POLLINATIONS_MODEL=flux` (FLUX.1 schnell) | `zimage`, `klein`, `gpt-image`, `google/gemini-nano-banana-2.1` … ([catalog](https://gen.pollinations.ai/image/models)) |
+| OpenAI | `OPENAI_API_KEY` | `OPENAI_IMAGE_MODEL=gpt-image-2.5-flare` | `gpt-image-2.5-sunburst`; `OPENAI_IMAGE_QUALITY=low/medium/high` |
+| Google Gemini ("Nano Banana") | `GEMINI_API_KEY` | `GEMINI_IMAGE_MODEL=gemini-nano-banana-2.1` | `gemini-3.1-flash-lite-image` (cheapest), `gemini-3-pro-image` |
+| Hugging Face | `HF_TOKEN` | `HF_IMAGE_MODEL=black-forest-labs/FLUX.1-schnell` | any [text-to-image model with an Inference Provider](https://huggingface.co/models?pipeline_tag=text-to-image&inference_provider=all); `HF_IMAGE_PROVIDER=auto` picks the provider |
+
+Examples:
+
+```bash
+# Gemini "Nano Banana"
+IMAGE_PROVIDER=gemini
+GEMINI_API_KEY=your-key
+GEMINI_IMAGE_MODEL=gemini-nano-banana-2.1
+
+# Hugging Face, a different model
+IMAGE_PROVIDER=huggingface
+HF_TOKEN=hf_your_token          # fine-grained token with "Make calls to Inference Providers"
+HF_IMAGE_MODEL=Qwen/Qwen-Image
+```
+
+### Which options are free?
+
+Checked in October 2026. Providers change their free tiers often, so check their pricing pages.
+
+| Option | Cost | Notes |
 |---|---|---|
-| OpenAI | `OPENAI_API_KEY=sk-...` | `OPENAI_IMAGE_MODEL=gpt-image-1` (or `dall-e-3`), `OPENAI_IMAGE_QUALITY=low/medium/high` |
-| Google Gemini | `GEMINI_API_KEY=...` | `GEMINI_IMAGE_MODEL=gemini-2.5-flash-image` |
-| Pollinations.ai | `POLLINATIONS_TOKEN=...` | free key at [enter.pollinations.ai](https://enter.pollinations.ai), FLUX by default (`POLLINATIONS_MODEL`) |
-| Hugging Face | `HF_TOKEN=hf_...` | `HF_IMAGE_MODEL=black-forest-labs/FLUX.1-schnell` |
-| *(none of the above)* | nothing | Pollinations' **keyless** tier: works without sign-up, but it is rate-limited per IP, lower quality and watermarked. Good for a quick demo; use a key for reliable results. |
+| Pollinations, no key (default) | free | No sign-up, but rate-limited per IP, lower quality and watermarked; occasional outages |
+| Pollinations, free account key | free account; FLUX ≈ 0.002 Pollen per image | No watermark and higher limits. Pollen can be earned through their quests or bought. Premium models such as Nano Banana cost more Pollen |
+| Hugging Face | **not free** for free accounts | Free accounts get no monthly Inference Providers credits; PRO ($9/month) includes $2/month, or buy credits |
+| Gemini API ("Nano Banana") | **paid** (~$0.03–0.07 per image) | The Gemini API has no free tier for image models; Nano Banana is free only inside the Google AI Studio web app, not via the API |
+| OpenAI | **paid** | Requires API credit; image models may also require organization verification |
 
-Force a provider with `IMAGE_PROVIDER=openai|gemini|pollinations|huggingface`, or disable the feature with
-`IMAGE_PROVIDER=none`.
+Disable the feature with `IMAGE_PROVIDER=none`.
 
 ---
 

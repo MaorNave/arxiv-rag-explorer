@@ -112,12 +112,13 @@ class Settings:
     pollinations_token: str | None = None
     openai_api_key: str | None = None
     openai_base_url: str = "https://api.openai.com/v1"
-    openai_image_model: str = "gpt-image-1"
+    openai_image_model: str = "gpt-image-2.5-flare"
     openai_image_quality: str = "low"
     gemini_api_key: str | None = None
-    gemini_image_model: str = "gemini-2.5-flash-image"
+    gemini_image_model: str = "gemini-nano-banana-2.1"
     hf_token: str | None = None
     hf_image_model: str = "black-forest-labs/FLUX.1-schnell"
+    hf_image_provider: str = "auto"
 
     log_level: str = "INFO"
 
@@ -196,6 +197,7 @@ class Settings:
             gemini_image_model=_env("GEMINI_IMAGE_MODEL", cls.gemini_image_model),
             hf_token=_env("HF_TOKEN") or _env("HUGGINGFACEHUB_API_TOKEN"),
             hf_image_model=_env("HF_IMAGE_MODEL", cls.hf_image_model),
+            hf_image_provider=_env("HF_IMAGE_PROVIDER", cls.hf_image_provider),
             log_level=(_env("LOG_LEVEL", cls.log_level) or "INFO").upper(),
         )
 

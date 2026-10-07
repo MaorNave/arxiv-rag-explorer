@@ -37,3 +37,6 @@ uvicorn>=0.30
 python-multipart>=0.0.9
 httpx>=0.27
 python-dotenv>=1.0
+
+# Bonus image generation: Hugging Face's InferenceClient returns PIL images
+pillow>=10

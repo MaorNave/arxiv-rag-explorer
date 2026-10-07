@@ -62,25 +62,81 @@ def test_pollinations_with_token_uses_the_authenticated_api(settings):
 def test_openai_provider(settings):
     def handler(request):
         body = json.loads(request.content)
-        assert request.url.path == "/v1/images/generations" and body["model"] == "gpt-image-1"
+        assert request.url.path == "/v1/images/generations" and body["model"] == "gpt-image-2.5-flare"
         return httpx.Response(200, json={"data": [{"b64_json": base64.b64encode(PNG).decode()}]})
 
     gen = generator(settings, handler, image_provider="openai", openai_api_key="sk")
     assert asyncio.run(gen.generate("prompt"))["provider"] == "openai"
 
 
+GEMINI_IMAGE = {"candidates": [{"content": {"parts": [
+    {"text": "here"}, {"inlineData": {"mimeType": "image/png", "data": base64.b64encode(PNG).decode()}},
+]}}]}
+
+
 def test_gemini_provider(settings):
     def handler(request):
         assert request.headers["x-goog-api-key"] == "g"
-        part = {"inlineData": {"mimeType": "image/png", "data": base64.b64encode(PNG).decode()}}
-        return httpx.Response(200, json={"candidates": [{"content": {"parts": [{"text": "here"}, part]}}]})
+        assert request.url.path == "/v1/models/gemini-nano-banana-2.1:generateContent"
+        config = json.loads(request.content)["generationConfig"]
+        assert config["responseFormat"] == {"image": {"aspectRatio": "16:9"}}
+        return httpx.Response(200, json=GEMINI_IMAGE)
 
     gen = generator(settings, handler, image_provider="gemini", gemini_api_key="g")
     assert asyncio.run(gen.generate("prompt"))["mime_type"] == "image/png"
 
 
-def test_huggingface_provider_rejects_non_images(settings):
-    gen = generator(settings, lambda r: httpx.Response(200, json={"error": "loading"}),
-                    image_provider="huggingface", hf_token="hf")
-    with pytest.raises(ImageGenerationError, match="Expected an image"):
+def test_gemini_retries_without_aspect_ratio_when_rejected(settings):
+    calls = []
+
+    def handler(request):
+        config = json.loads(request.content)["generationConfig"]
+        calls.append(config)
+        if "responseFormat" in config:
+            return httpx.Response(400, json={"error": {"message": "Unknown name responseFormat"}})
+        return httpx.Response(200, json=GEMINI_IMAGE)
+
+    gen = generator(settings, handler, image_provider="gemini", gemini_api_key="g",
+                    gemini_image_model="gemini-3-pro-image")
+    asyncio.run(gen.generate("prompt"))
+    assert len(calls) == 2 and calls[1] == {"responseModalities": ["TEXT", "IMAGE"]}
+
+
+class FakeInferenceClient:
+    """Stands in for huggingface_hub.InferenceClient (no network)."""
+
+    status = None
+    seen: dict = {}
+
+    def __init__(self, provider=None, api_key=None, timeout=None):
+        FakeInferenceClient.seen = {"provider": provider, "api_key": api_key}
+
+    def text_to_image(self, prompt, *, model, width, height):
+        from huggingface_hub.errors import HfHubHTTPError
+
+        FakeInferenceClient.seen.update(model=model, size=(width, height))
+        if self.status:
+            response = httpx.Response(self.status, request=httpx.Request("POST", "https://router.huggingface.co"))
+            raise HfHubHTTPError("error", response=response)
+        from PIL import Image
+
+        return Image.new("RGB", (8, 8), "purple")
+
+
+def test_huggingface_provider_uses_the_routed_client(settings, monkeypatch):
+    monkeypatch.setattr("huggingface_hub.InferenceClient", FakeInferenceClient)
+    FakeInferenceClient.status = None
+    gen = ImageGenerator(replace(settings, image_provider="huggingface", hf_token="hf_x"))
+    image = asyncio.run(gen.generate("prompt"))
+    assert image["mime_type"] == "image/png"
+    assert FakeInferenceClient.seen == {"provider": "auto", "api_key": "hf_x",
+                                        "model": "black-forest-labs/FLUX.1-schnell", "size": (1024, 576)}
+
+
+@pytest.mark.parametrize("status, phrase", [(401, "Inference Providers"), (402, "credits")])
+def test_huggingface_errors_are_actionable(settings, monkeypatch, status, phrase):
+    monkeypatch.setattr("huggingface_hub.InferenceClient", FakeInferenceClient)
+    FakeInferenceClient.status = status
+    gen = ImageGenerator(replace(settings, image_provider="huggingface", hf_token="hf_x"))
+    with pytest.raises(ImageGenerationError, match=phrase):
         asyncio.run(gen.generate("prompt"))
