@@ -3,7 +3,8 @@
 **Grounded, cited answers over a collection of research abstracts, running 100% locally.**
 LangGraph orchestrates a LangChain pipeline: query understanding with **Qwen 3.5** (via Ollama), hybrid retrieval
 (**Chroma** vectors + **SQLite FTS5** BM25), local **cross-encoder reranking**, and streamed generation, with an
-optional illustration from an external image API.
+optional illustration (a local **FLUX.2** model on Macs, or a free image API). `python3 main.py` installs and starts
+everything it needs, Ollama included.
 
 ![Answer view: pipeline progress, streamed answer with citation chips, retrieved context with rank badges](docs/screenshot-light.png)
 
@@ -38,7 +39,7 @@ optional illustration from an external image API.
 **Prerequisite:** Python 3.10+. That's all: no Docker, and nothing else to install by hand.
 
 ```bash
-git clone <your-repo-url> arxiv-rag && cd arxiv-rag
+git clone https://github.com/MaorNave/arxiv-rag-explorer.git && cd arxiv-rag-explorer
 python3 main.py            # Windows: py main.py      → http://127.0.0.1:8080
 ```
 
@@ -63,8 +64,9 @@ The UI is at **http://127.0.0.1:8080** and the API docs at **/docs**. Later star
 
 > **Why isn't everything in `requirements.txt`?** pip can only install Python packages. The Python packages
 > come from `requirements.txt`; Ollama and the model weights are downloaded by the app itself, so
-> `python3 main.py` is the whole installation. To download everything up front instead, run
-> `.venv/bin/python -m rag_app.setup_models` (for example `--llm qwen3.5:9b`).
+> `python3 main.py` is the whole installation. To download Ollama, the models and the reranker up front
+> instead, run `.venv/bin/python -m rag_app.setup_models` (for example `--llm qwen3.5:9b`); the optional
+> local image model is still set up by the app, in the background.
 
 ---
 
@@ -86,12 +88,14 @@ If you started the app with another `PORT`, use that number instead of `8080` in
 **PyCharm:** open `main.py` and press ▶ *Run* (any interpreter works: missing packages are installed into the
 project's `.venv` or the selected virtual environment); the ■ *Stop* button stops it.
 
-**Ollama stops with the app**, when the app is running its own copy (and so does the local image server on macOS).
-If you use your own Ollama installation instead, it keeps running: idle models are unloaded after 30 minutes
-(`LLM_KEEP_ALIVE`), or right away with `ollama stop qwen3.5:4b`.
+**Ollama stops with the app**, when the app is running its own copy (and so does the local image server on macOS),
+even if you stop the app in the middle of its first-run setup. The command-line tools (`rag_app.setup_models`, the
+benchmark) clean up the same way after an error, <kbd>Ctrl</kbd>+<kbd>C</kbd> or `kill`. If you use your own Ollama
+installation instead, it keeps running: idle models are unloaded after 30 minutes (`LLM_KEEP_ALIVE`), or right away
+with `ollama stop qwen3.5:4b` and `ollama stop nomic-embed-text`.
 
-**Start fresh:** delete the `storage/` folder (index, the app's Ollama copy, its models, and generated images); the
-next `python main.py` sets everything up again.
+**Start fresh:** delete the `storage/` folder (index, the app's Ollama copy and its models, the reranker, uploads and
+generated images); the next `python main.py` sets everything up again.
 
 ---
 
@@ -131,7 +135,8 @@ flowchart LR
     U --> R["retrieve<br/><small>Chroma + FTS5 BM25<br/>weighted RRF · 20 candidates</small>"]
     R --> X["rerank<br/><small>MiniLM cross-encoder<br/>ONNX · top-k</small>"]
     X --> G["generate_answer<br/><small>Qwen · streamed · cited</small>"]
-    X -. "generate_image = true" .-> I["generate_image<br/><small>external API</small>"]
+    X -. "image via a free API<br/>(in parallel)" .-> I["generate_image<br/><small>local FLUX.2 or free API</small>"]
+    G -. "image via the local model<br/>(after the answer)" .-> I
     G --> F["finalize<br/><small>response JSON</small>"]
     I --> F
 ```
@@ -142,7 +147,7 @@ flowchart LR
 | `retrieve` | Embeds all queries in one batch, runs one dense search per query plus one BM25 search, and fuses everything with **weighted RRF** (`Σ w / (60 + rank)`), keeping the best chunk per paper. |
 | `rerank` | A local cross-encoder reads (question, abstract) pairs together. Its ranking is blended with the hybrid ranking (RRF again) to pick the final `top_k`. If the model is unavailable, the hybrid order passes through. |
 | `generate_answer` | Streams tokens from Qwen. Citations are parsed from `[n]` markers and repaired when the model writes `[Abstract 2]` or a raw doc id. |
-| `generate_image` | Runs in the **same super-step** as `generate_answer` (LangGraph executes them concurrently), so the image never delays the text. |
+| `generate_image` | Only when an image was requested. A free external API runs in the **same super-step** as `generate_answer` (LangGraph executes them concurrently); the local model runs right **after** the answer, so it never competes with Qwen for the GPU. Either way the image never delays the text. |
 | `finalize` | Builds the response: `answer`, `citations`, `retrieved_context`, `sources`, `query_analysis`, `images`, `metrics`. |
 
 Each node publishes progress through LangGraph's custom stream (`get_stream_writer`). `/stream` forwards these
@@ -165,7 +170,8 @@ flowchart LR
   The same content under another name reuses the index; any real change triggers a rebuild.
 - **Crash-safe:** each build gets fresh, uniquely named collection and keyword files, and `manifest.json` is
   replaced atomically only after success. An interrupted build is simply rebuilt next time.
-- **Model-specific prefixes:** e.g. nomic's `search_document:` / `search_query:`, applied automatically.
+- **Model-specific prefixes:** e.g. nomic's `search_document:` / `search_query:`, applied automatically
+  (`EMBED_DOC_PREFIX` / `EMBED_QUERY_PREFIX` override them for other models).
 - **Live progress** (`/api/status`): processed / total, docs/s and ETA, shown in the UI as a progress bar.
 
 ---
@@ -312,11 +318,12 @@ nothing to run or install by hand:
   after startup, the app downloads Ollama 0.32.5 into `storage/runtime/` (146 MB) and runs it on
   `127.0.0.1:11435` for images only. It reuses `x/flux2-klein:4b` from your regular Ollama when present (zero-copy
   clones); otherwise it downloads the model (5.7 GB). The image toggle shows the progress.
-- **Your regular Ollama is untouched** and keeps serving Qwen. If the app is running its own Ollama anyway (no
+- **Your regular Ollama is untouched** and keeps serving Qwen. While it is 0.32.6 or newer, image requests go only
+  to the app's 0.32.5 server, even if your Ollama has the model too. If the app is running its own Ollama anyway (no
   Ollama on the machine), that same copy serves images too.
 - **It starts and stops with the app.** While it's being set up, or if it fails, the free APIs are used.
 - **The answer is not slowed down.** Local images start once the answer is complete. Measured on an M1 Pro with
-  16 GB: the answer took ~20 s as usual, then a 1024×576 image took ~40–45 s, peaking at ~7.6 GB of memory.
+  16 GB: the answer took ~16–20 s as usual, then a 1024×576 image took ~40–50 s, peaking at ~7.6 GB of memory.
 - On Linux and Windows the app uses the free external APIs. Set `OLLAMA_IMAGE_BASE_URL` to use another Ollama
   server for images.
 
@@ -347,6 +354,7 @@ commented list. The main ones:
 | `RERANKER_MODEL` | `cross-encoder/ms-marco-MiniLM-L6-v2` | `none` disables reranking |
 | `REWRITE_WEIGHT` / `KEYWORD_WEIGHT` | `auto` | RRF weights (1.0/1.0 with the reranker, 0.25/1.5 without) |
 | `LLM_THINKING` | `false` | let Qwen think first; the reasoning streams into a collapsible panel |
+| `LLM_KEEP_ALIVE` | `30m` | how long Ollama keeps the models loaded after a request (Ollama durations: `10m`, `1h30m`; `-1` = always) |
 | `STORAGE_DIR` | `storage` | index, models, uploads, images |
 | `IMAGE_PROVIDER` | `auto` | `auto` (local → Cloudflare → Pollinations), `ollama`, `cloudflare`, `pollinations` or `none`; see [image generation](#bonus-image-generation) |
 
@@ -391,11 +399,15 @@ Results with k=5 on the bundled dataset (`qwen3.5:4b`, `nomic-embed-text`):
 
 | Strategy | semantic hit@5 | paraphrased hit@5 | paraphrased MRR@5 | named hit@1 | named hit@5 |
 |---|---|---|---|---|---|
-| dense only | 0.97 | 0.57 | 0.45 | 0.60 | 0.80 |
+| dense only | 0.97 | 0.57 | 0.45 | 0.60 | 0.85 |
 | BM25 only | 1.00 | 0.45 | 0.37 | 0.95 | 0.95 |
-| hybrid (RRF) | 1.00 | 0.60 | 0.46 | 0.80 | 0.95 |
+| hybrid (RRF) | 1.00 | 0.60 | 0.46 | 0.85 | 0.95 |
 | hybrid + LLM query plan | 1.00 | 0.62 | 0.47 | 0.95 | 1.00 |
 | **hybrid + plan + rerank (default)** | **1.00** | **0.80** | **0.59** | **0.95** | **1.00** |
+
+The *named* columns of the dense and hybrid rows move by one or two of the 20 queries between runs (±0.05–0.10):
+Chroma's approximate nearest-neighbour search isn't bit-identical from one process to the next, although the
+embeddings are. The default pipeline's row was identical in every run we compared.
 
 Reranking adds ~0.57 s per question. The benchmark drove three design decisions:
 
@@ -405,42 +417,59 @@ Reranking adds ~0.57 s per question. The benchmark drove three design decisions:
    "diffusion" were pulling exact matching off-topic.
 3. **The cross-encoder.** It's the only configuration that is best or tied-best on every query set.
 
-Run it yourself (stop the web app first so the two don't compete for the GPU):
-`python scripts/eval_retrieval.py --n 40 --named 20 --k 5`.
+Run it yourself (several minutes the first time, while the local LLM writes the questions and query plans; about
+1.5 min once they are cached; on Windows use `.venv\Scripts\python`):
+
+```bash
+.venv/bin/python scripts/eval_retrieval.py --n 40 --named 20 --k 5
+```
+
+Stop the web app first and keep it stopped during the run: the two would compete for the GPU, and an Ollama the
+script starts is stopped when it ends. Like `main.py`, the script uses a running Ollama or sets up the app's own
+copy, and pulls missing models. The generated questions and query plans are cached in `storage/eval_*.json` (delete
+them to regenerate), so an interrupted run resumes where it stopped.
 
 ---
 
 ## Tests
 
 ```bash
-pip install -r requirements-dev.txt
-pytest -q          # 55 tests, ~4 s, fully offline
+.venv/bin/pip install -r requirements-dev.txt    # adds pytest to the project's .venv
+.venv/bin/python -m pytest -q                    # 58 tests, ~4 s, fully offline
 ```
 
-The suite never touches Ollama or the network: it uses deterministic bag-of-words embeddings and LangChain's
-`GenericFakeChatModel`. It covers:
+(On Windows use `.venv\Scripts\pip` and `.venv\Scripts\python`.) The suite never touches Ollama or the network: it
+uses deterministic bag-of-words embeddings, LangChain's `GenericFakeChatModel`, mocked HTTP and a fake
+`ollama serve`. It covers:
 
 - streaming loading, malformed and duplicate records, `DATA_PATH` fallbacks;
-- fingerprint reuse vs rebuild, cleanup of old indexes, forced rebuilds;
+- fingerprint reuse vs rebuild, cleanup of old indexes, forced rebuilds, `LLM_KEEP_ALIVE` durations;
 - hybrid retrieval and its ablation modes, weighted fusion, reranker blending;
 - citation parsing;
 - the API schema, the SSE event order, validation errors, `503` before the index exists, and dataset upload →
   rebuild;
+- startup: answers while the reranker is still downloading or after it failed, and a failed Ollama setup that keeps
+  its reason on screen;
+- the app's own Ollama: download and unpack, start/stop, reuse of models from an existing Ollama, and that stopping
+  the app mid-setup or interrupting a start never leaves a server running;
 - the image branch: success, failure, and the guarantee that a slow image doesn't delay the answer;
 - the free image chain (local Ollama, Cloudflare Workers AI, Pollinations) against mocked HTTP: fallbacks,
-  error messages, and that a local model runs after the answer instead of competing with it.
+  error messages, which Ollama server gets the local model, and that it runs after the answer instead of competing
+  with it.
 
 ---
 
 ## Project layout
 
 ```
-├── main.py                  # python main.py → http://127.0.0.1:8080
+├── main.py                  # python main.py → http://127.0.0.1:8080 (sets up .venv on the first run)
 ├── requirements.txt         # runtime deps (models are pulled automatically, see Quick start)
 ├── requirements-dev.txt     # + pytest
 ├── .env.example             # every setting, documented
 ├── data/arxiv_2.9k.jsonl    # sample dataset (arXiv metadata)
+├── docs/                    # screenshots used in this README
 ├── rag_app/
+│   ├── __main__.py          # python -m rag_app: CLI flags, logging, web server
 │   ├── config.py            # settings from env / .env
 │   ├── dataset.py           # DATA_PATH resolution, streaming LangChain loader, fingerprinting
 │   ├── embeddings.py        # Ollama embeddings + model-specific task prefixes
@@ -454,12 +483,16 @@ The suite never touches Ollama or the network: it uses deterministic bag-of-word
 │   ├── images.py            # bonus image providers
 │   ├── service.py           # startup orchestration, dataset watcher, answer/stream
 │   ├── server.py            # FastAPI: UI, /answer, /stream, /api/*
+│   ├── schemas.py           # request/response models of the API
+│   ├── status.py            # startup / indexing progress shared with the UI
 │   ├── setup_models.py      # Ollama checks + model downloads (also an optional CLI)
 │   ├── runtime.py           # the app's own Ollama: download, start/stop, model reuse
 │   └── static/              # the web UI (vanilla HTML/CSS/JS, no build step)
 ├── scripts/
 │   └── eval_retrieval.py    # retrieval benchmark
-└── tests/                   # offline pytest suite
+├── tests/                   # offline pytest suite
+└── storage/                 # created on the first run, git-ignored: index/, models/ (reranker), runtime/
+                             #   (the app's own Ollama and its models), images/, uploads/, downloads/
 ```
 
 ---
@@ -468,8 +501,8 @@ The suite never touches Ollama or the network: it uses deterministic bag-of-word
 
 - **Ollama for every model call, installed by the app itself.** One local runtime serves the LLM, the embeddings
   and (on macOS) images, with GPU acceleration where available and CPU otherwise. When no Ollama is running, the
-  app downloads and supervises its own copy in `storage/`. Together with model pulls through the Ollama API, this
-  is what makes "pip install + `python main.py`" the whole installation, without Docker.
+  app downloads and supervises its own copy in `storage/` and never leaves it running behind it. Together with model
+  pulls through the Ollama API, this is what makes `python main.py` the whole installation, without Docker.
 - **Qwen 3.5 4B with thinking off.** It is fast (~35 tok/s on an M1) and its structured-output support makes query
   planning reliable. Thinking can be switched on (`LLM_THINKING=true`): the reasoning streams into a collapsible
   panel and an extra token budget is reserved for it. Expect answers to take ~4× longer (≈60 s instead of ≈15 s).
@@ -497,7 +530,8 @@ The suite never touches Ollama or the network: it uses deterministic bag-of-word
 
 | Symptom | Fix |
 |---|---|
-| UI says *Waiting for Ollama* | Only happens with a remote `OLLAMA_BASE_URL` (or `MANAGED_OLLAMA=false`): start Ollama on that server. With the default local URL the app runs its own copy. |
+| UI says *Waiting for Ollama* | `OLLAMA_BASE_URL` points to another machine (or `MANAGED_OLLAMA=false`): start Ollama there. The page continues by itself once Ollama answers. |
+| UI says *Could not set up Ollama automatically* | The app couldn't download or start its own Ollama, and the message says why (e.g. no internet on the first run). Fix that and restart the app, or start Ollama yourself: the page continues by itself once it answers. |
 | First start is slow | Ollama and the models are downloading into `storage/`; progress is shown in the UI and the terminal. Later starts take seconds. |
 | The first answer after a while is slow | Ollama unloads idle models after `LLM_KEEP_ALIVE` (30 min). Other apps using *different* Ollama models at the same time can also force model swaps. |
 | Out of memory / very slow on CPU | Use a smaller `LLM_MODEL` (see [hardware](#models-and-hardware)), lower `LLM_NUM_CTX` to `4096`, or set `QUERY_REWRITE=false`. |
