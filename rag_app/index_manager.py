@@ -83,10 +83,6 @@ class IndexManager:
     def active(self) -> ActiveIndex | None:
         return self._active
 
-    @property
-    def is_building(self) -> bool:
-        return self._build_lock.locked()
-
     def require_active(self) -> ActiveIndex:
         index = self._active
         if index is None:

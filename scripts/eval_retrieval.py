@@ -17,7 +17,9 @@ Each query has one relevant paper. We report hit@1, hit@k and MRR@k for:
     hybrid+plan       + LLM query plan (rewrites + keywords), weights tuned for no reranker
     hybrid+plan+rerank  the full pipeline: broad recall + cross-encoder reranking
 
-Usage (stop the web app first so both do not compete for the GPU):
+Usage (stop the web app first and keep it stopped: both would compete for the GPU, and an
+Ollama this run starts is stopped at its end; with no Ollama running, the app's own copy in
+STORAGE_DIR/runtime is used and missing models are pulled, like `python main.py` does):
     python scripts/eval_retrieval.py --n 40 --k 5
 Generated questions and query plans are cached in STORAGE_DIR/eval_*.json
 (delete them to regenerate).
@@ -29,6 +31,7 @@ import argparse
 import json
 import random
 import re
+import signal
 import sqlite3
 import sys
 import time
@@ -45,6 +48,8 @@ from rag_app.llm import build_analyzer, build_chat_model  # noqa: E402
 from rag_app.prompts import ANALYSIS_PROMPT  # noqa: E402
 from rag_app.reranker import CrossEncoderReranker, blend_rankings  # noqa: E402
 from rag_app.retriever import HybridRetriever  # noqa: E402
+from rag_app.runtime import RuntimeManager  # noqa: E402
+from rag_app.setup_models import cli_progress, connect, ensure_models  # noqa: E402
 
 QUESTION_PROMPT = """\
 Here is a research paper abstract:
@@ -79,14 +84,16 @@ def build_queries(settings: Settings, docs, all_rows, n_named: int, seed: int, c
     cached = json.loads(cache.read_text()) if cache.exists() else {}
     llm = build_chat_model(settings, temperature=0.7, num_predict=80, thinking=False)
     queries = []
-    for query_set, prompt, prefix in (("semantic", QUESTION_PROMPT, ""), ("paraphrased", PARAPHRASE_PROMPT, "para:")):
-        for doc_id, title, abstract in docs:
-            question = cached.get(prefix + doc_id)
-            if not question:
-                question = llm.invoke(prompt.format(abstract=abstract)).text.strip().strip('"')
-                cached[prefix + doc_id] = question
-            queries.append({"set": query_set, "question": question, "doc_id": doc_id, "title": title})
-    cache.write_text(json.dumps(cached, indent=1))
+    try:
+        for query_set, prompt, prefix in (("semantic", QUESTION_PROMPT, ""), ("paraphrased", PARAPHRASE_PROMPT, "para:")):
+            for doc_id, title, abstract in docs:
+                question = cached.get(prefix + doc_id)
+                if not question:
+                    question = llm.invoke(prompt.format(abstract=abstract)).text.strip().strip('"')
+                    cached[prefix + doc_id] = question
+                queries.append({"set": query_set, "question": question, "doc_id": doc_id, "title": title})
+    finally:  # keep what was generated even if the run stops half-way (a re-run resumes)
+        cache.write_text(json.dumps(cached, indent=1))
 
     named = [(d, t, NAMED_TITLE.match(t).group(1)) for d, t, _ in all_rows if NAMED_TITLE.match(t)]
     random.Random(seed).shuffle(named)
@@ -111,6 +118,20 @@ def main() -> None:
     args = parser.parse_args()
 
     settings = Settings.from_env()
+    models = [settings.llm_model, settings.embed_model]
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))  # `kill` unwinds too, through the finally below
+    runtime = RuntimeManager(settings)
+    try:
+        if connect(settings, runtime, models) is None:
+            sys.exit(1)
+        if ensure_models(settings.ollama_base_url, models, pull=settings.auto_pull_models, on_progress=cli_progress()):
+            print()
+        run(args, settings)
+    finally:
+        runtime.stop()
+
+
+def run(args: argparse.Namespace, settings: Settings) -> None:
     embeddings = build_embeddings(settings)
     manager = IndexManager(settings, embeddings)
     index = manager.load_or_build(resolve_dataset_path(settings.data_path, settings.downloads_dir))
@@ -131,37 +152,39 @@ def main() -> None:
     results = {s: {"semantic": [], "paraphrased": [], "named": []} for s in strategies}
     rerank_seconds = []
     plan_seconds = []
-    for i, q in enumerate(queries, start=1):
-        for strategy in strategies:
-            mode = "hybrid" if strategy.startswith("hybrid") else strategy
-            reranking = strategy.endswith("rerank")
-            rewrite_weight, keyword_weight = fusion_weights(settings, reranking)
-            retriever = HybridRetriever(
-                index=index, k=args.k, fetch_k=settings.fetch_k, mode=mode,
-                keyword_weight=keyword_weight if strategy.startswith("hybrid+plan") else 1.0,
-            )
-            if strategy.startswith("hybrid+plan"):
-                plan_dict = plan_cache.get(q["question"])
-                if plan_dict is None:
-                    started = time.perf_counter()
-                    plan = analyzer.invoke(ANALYSIS_PROMPT.format_messages(question=q["question"]))
-                    plan_seconds.append(time.perf_counter() - started)
-                    plan_dict = {"search_queries": plan.search_queries, "keywords": plan.keywords}
-                    plan_cache[q["question"]] = plan_dict
-                queries, weights, keywords = retrieval_inputs(q["question"], plan_dict, rewrite_weight)
-                limit = settings.rerank_candidates if reranking else args.k
-                passages = retriever.search(queries, keywords, limit, weights=weights)
-                if reranking:
-                    query = q["question"] if _mostly_latin(q["question"]) else (plan_dict["search_queries"] or [q["question"]])[0]
-                    started = time.perf_counter()
-                    scores = reranker.score(query, [f"{p.title}. {p.text}" for p in passages])
-                    rerank_seconds.append(time.perf_counter() - started)
-                    passages = [passages[i] for i, _, _ in blend_rankings(scores, settings.rerank_weight)[: args.k]]
-            else:
-                passages = retriever.search([q["question"]], [], args.k)
-            results[strategy][q["set"]].append(rank_of(passages, q["doc_id"]))
-        print(f"  [{i}/{len(queries)}] {q['set']:8s} {q['question'][:90]}", flush=True)
-    plan_cache_path.write_text(json.dumps(plan_cache, indent=1))
+    try:
+        for i, q in enumerate(queries, start=1):
+            for strategy in strategies:
+                mode = "hybrid" if strategy.startswith("hybrid") else strategy
+                reranking = strategy.endswith("rerank")
+                rewrite_weight, keyword_weight = fusion_weights(settings, reranking)
+                retriever = HybridRetriever(
+                    index=index, k=args.k, fetch_k=settings.fetch_k, mode=mode,
+                    keyword_weight=keyword_weight if strategy.startswith("hybrid+plan") else 1.0,
+                )
+                if strategy.startswith("hybrid+plan"):
+                    plan_dict = plan_cache.get(q["question"])
+                    if plan_dict is None:
+                        started = time.perf_counter()
+                        plan = analyzer.invoke(ANALYSIS_PROMPT.format_messages(question=q["question"]))
+                        plan_seconds.append(time.perf_counter() - started)
+                        plan_dict = {"search_queries": plan.search_queries, "keywords": plan.keywords}
+                        plan_cache[q["question"]] = plan_dict
+                    search_queries, weights, keywords = retrieval_inputs(q["question"], plan_dict, rewrite_weight)
+                    limit = max(settings.rerank_candidates, args.k) if reranking else args.k  # as the app
+                    passages = retriever.search(search_queries, keywords, limit, weights=weights)
+                    if reranking:
+                        query = q["question"] if _mostly_latin(q["question"]) else (plan_dict["search_queries"] or [q["question"]])[0]
+                        started = time.perf_counter()
+                        scores = reranker.score(query, [f"{p.title}. {p.text}" for p in passages])
+                        rerank_seconds.append(time.perf_counter() - started)
+                        passages = [passages[i] for i, _, _ in blend_rankings(scores, settings.rerank_weight)[: args.k]]
+                else:
+                    passages = retriever.search([q["question"]], [], args.k)
+                results[strategy][q["set"]].append(rank_of(passages, q["doc_id"]))
+            print(f"  [{i}/{len(queries)}] {q['set']:8s} {q['question'][:90]}", flush=True)
+    finally:  # keep the plans made so far even if the run stops half-way (a re-run resumes)
+        plan_cache_path.write_text(json.dumps(plan_cache, indent=1))
 
     def stats(ranks: list[int | None]) -> tuple[float, float, float]:
         n = len(ranks) or 1

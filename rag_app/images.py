@@ -54,7 +54,6 @@ _OLLAMA_UNSUPPORTED = (
 )
 
 
-
 class ImageGenerationError(RuntimeError):
     pass
 
@@ -163,7 +162,6 @@ class ImageGenerator:
             "model": self.model_for(provider),
             "keyless": provider == "pollinations" and not self.settings.pollinations_token,
             "chain": [PROVIDER_LABELS[p] for p in self.chain()],
-            "local": provider == "ollama",
             "local_url": self.local_url,
             "runs_after_answer": self.runs_after_answer,
             "available": self.available,

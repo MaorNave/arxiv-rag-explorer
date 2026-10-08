@@ -3,6 +3,7 @@
 import io
 import json
 import socket
+import subprocess
 import sys
 import tarfile
 from dataclasses import replace
@@ -102,6 +103,35 @@ def test_install_start_and_stop(tmp_path, monkeypatch):
     finally:
         server.stop()
     assert not server.is_up() and not server.pid_path.exists()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="the fake server is a POSIX script")
+def test_shutdown_during_setup_never_leaves_a_server_behind(tmp_path, settings, monkeypatch):
+    # The app stops while its setup thread is still on the way to start(): nothing may be spawned.
+    server = ManagedOllama(tmp_path / "runtime", free_port(), tmp_path / "models")
+    server.install_dir.mkdir(parents=True)
+    (server.install_dir / "ollama").write_text("#!/bin/sh\nexit 1\n")
+    (server.install_dir / "ollama").chmod(0o755)
+    server.stop()
+    with pytest.raises(RuntimeError, match="cancelled"):
+        server.start()
+    assert server.process is None
+
+    # Interrupted after `ollama serve` was spawned (e.g. Ctrl+C while waiting for it): it is stopped.
+    spawned = []
+
+    def start_then_interrupt(self, timeout_s=90.0):
+        self.process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        spawned.append(self.process)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(ManagedOllama, "install", lambda self, progress=None: None)
+    monkeypatch.setattr(ManagedOllama, "start", start_then_interrupt)
+    manager = RuntimeManager(settings)
+    with pytest.raises(KeyboardInterrupt):
+        manager.start_main([])
+    assert manager.main is None
+    assert spawned[0].wait(timeout=10) is not None  # terminated, not orphaned
 
 
 def test_runtime_manager_only_manages_local_servers(settings):

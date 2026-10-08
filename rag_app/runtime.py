@@ -156,7 +156,8 @@ class ManagedOllama:
         self.pid_path = runtime_dir / f"ollama-{port}.pid"
         self.process: subprocess.Popen | None = None
         self.adopted_pid: int | None = None
-        self._cancel = threading.Event()  # set by stop(): aborts a download in progress
+        self._cancel = threading.Event()  # set by stop(): aborts a download or start still in progress
+        self._lock = threading.Lock()  # stop() can run on another thread while start() spawns the server
         self._transport = transport  # injectable for offline tests
 
     @property
@@ -238,15 +239,18 @@ class ManagedOllama:
             "OLLAMA_NOPRUNE": "1",  # never delete model files
         }
         flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
-        with self.log_path.open("ab") as log_file:
-            self.process = subprocess.Popen(
-                [str(binary), "serve"], env=env, cwd=str(binary.parent),
-                stdin=subprocess.DEVNULL, stdout=log_file, stderr=subprocess.STDOUT, creationflags=flags,
-            )
-        self.pid_path.write_text(str(self.process.pid))
+        with self._lock:
+            if self._cancel.is_set():  # the app shut down while this was being set up
+                raise RuntimeError("Ollama start cancelled (the app is shutting down)")
+            with self.log_path.open("ab") as log_file:
+                process = self.process = subprocess.Popen(
+                    [str(binary), "serve"], env=env, cwd=str(binary.parent),
+                    stdin=subprocess.DEVNULL, stdout=log_file, stderr=subprocess.STDOUT, creationflags=flags,
+                )
+            self.pid_path.write_text(str(process.pid))
         deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline:
-            if self.process.poll() is not None:
+            if process.poll() is not None:
                 raise RuntimeError(f"Ollama exited during startup; see {self.log_path}")
             if self.is_up():
                 log.info("Started Ollama %s at %s (models: %s)", self.version, self.url, self.models_dir)
@@ -256,8 +260,9 @@ class ManagedOllama:
         raise RuntimeError(f"Ollama did not start within {timeout_s:.0f}s; see {self.log_path}")
 
     def stop(self) -> None:
-        self._cancel.set()
-        process, self.process = self.process, None
+        with self._lock:
+            self._cancel.set()
+            process, self.process = self.process, None
         if process is not None and process.poll() is None:
             process.terminate()
             try:
@@ -298,6 +303,7 @@ class RuntimeManager:
                 import_model(model, system_models_dir(), self.models_dir)
             server.start()
         except BaseException:
+            server.stop()  # a server spawned before the error (e.g. Ctrl+C while waiting) must not outlive it
             self.main = None
             raise
 
@@ -311,6 +317,7 @@ class RuntimeManager:
             import_model(self.settings.ollama_image_model, system_models_dir(), self.models_dir)
             server.start()
         except BaseException:
+            server.stop()
             self.images = None
             raise
         return server

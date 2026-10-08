@@ -11,9 +11,7 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
-from langchain_core.embeddings import Embeddings
 from langchain_core.language_models import BaseChatModel
-from langchain_core.runnables import Runnable
 
 from . import __version__
 from .config import Settings
@@ -66,20 +64,16 @@ class RAGService:
         self,
         settings: Settings,
         *,
-        embeddings: Embeddings | None = None,
+        embeddings: PrefixedEmbeddings | None = None,
         llm: BaseChatModel | None = None,
-        analyzer: Runnable | None = None,
-        image_generator: ImageGenerator | None = None,
         reranker: CrossEncoderReranker | None = None,
         use_ollama: bool = True,
     ):
         self.settings = settings
         self.status = StatusTracker()
-        if embeddings is not None and not isinstance(embeddings, PrefixedEmbeddings):
-            embeddings = PrefixedEmbeddings(embeddings, model=settings.embed_model)
         self.embeddings = embeddings or build_embeddings(settings)
         self.index = IndexManager(settings, self.embeddings, self.status)
-        self.image_generator = image_generator or ImageGenerator(settings)
+        self.image_generator = ImageGenerator(settings)
         if reranker is None and settings.reranker_enabled:
             reranker = CrossEncoderReranker(settings.reranker_model, settings.models_dir, settings.rerank_max_tokens)
         self.reranker = reranker
@@ -92,7 +86,6 @@ class RAGService:
         self.ollama_version: str | None = None
         self.graph = None
         self._llm = llm
-        self._analyzer = analyzer
         self._tasks: set[asyncio.Task] = set()
         self._reindex_lock = asyncio.Lock()
         self._watch_sig: tuple | None = None
@@ -146,10 +139,18 @@ class RAGService:
 
     async def _wait_for_ollama(self) -> None:
         url = self.settings.ollama_base_url
-        self.ollama_version = await asyncio.to_thread(ollama_version, url)
-        if not self.ollama_version and self.runtime.can_run_main():
-            await self._start_managed_ollama()
-        hinted = False
+        failure = None
+        if self.runtime.can_run_main() and not await asyncio.to_thread(ollama_version, url):
+            failure = await self._start_managed_ollama()
+        if failure:  # keep the reason on screen: the generic advice below is what just failed
+            state = "error"
+            message = (f"Could not set up Ollama automatically ({failure}). Restart the app to try again, "
+                       f"or start Ollama at {url}; this page updates automatically.")
+        else:
+            state = "waiting_for_ollama"
+            message = (f"Waiting for Ollama at {url}. Start it there (or use a local OLLAMA_BASE_URL so the "
+                       "app can run its own copy); this page updates automatically.")
+        hinted = failure is not None  # the failure itself was logged already
         while True:
             self.ollama_version = await asyncio.to_thread(ollama_version, url)
             if self.ollama_version:
@@ -158,15 +159,14 @@ class RAGService:
             if not hinted:
                 log.warning(INSTALL_HINT.format(url=url))
                 hinted = True
-            self.status.set_state(
-                "waiting_for_ollama",
-                f"Waiting for Ollama at {url}. Start it there (or use a local OLLAMA_BASE_URL so the app can "
-                "run its own copy); this page updates automatically.",
-            )
+            self.status.set_state(state, message, error=failure)
             await asyncio.sleep(3)
 
-    async def _start_managed_ollama(self) -> None:
-        """No Ollama is running: download a private copy into STORAGE_DIR/runtime and run it."""
+    async def _start_managed_ollama(self) -> str | None:
+        """No Ollama is running: download a private copy into STORAGE_DIR/runtime and run it.
+
+        Returns why that failed, or None once it runs.
+        """
         s = self.settings
 
         def progress(percent: float | None, text: str) -> None:
@@ -179,9 +179,8 @@ class RAGService:
             await asyncio.to_thread(self.runtime.start_main, reuse, progress)
         except Exception as exc:
             log.warning("Could not run the app's own Ollama: %s", exc)
-            self.status.set_state("error", f"Could not start Ollama automatically: {exc}", error=str(exc))
-            return
-        self.ollama_version = await asyncio.to_thread(ollama_version, s.ollama_base_url)
+            return str(exc) or type(exc).__name__
+        return None
 
     def _local_images_wanted(self) -> bool:
         s = self.settings
@@ -249,11 +248,14 @@ class RAGService:
         await self._refresh_local_image()
 
     async def _refresh_local_image(self) -> None:
-        """Point the image generator at the first Ollama server that has the image model."""
+        """Point the image generator at the first Ollama server that has the image model and can run it."""
         generator = self.image_generator
         model = normalize(self.settings.ollama_image_model)
         found = None
         for url in generator.local_candidates():
+            if (url == self.settings.ollama_base_url and self._local_images_wanted()
+                    and not supports_image_generation(self.ollama_version)):
+                continue  # too new to run the model: the app's own 0.32.5 image server takes over
             try:
                 if model in await asyncio.to_thread(local_models, url):
                     found = url
@@ -305,8 +307,8 @@ class RAGService:
 
     def _build_pipeline(self, supports_thinking: bool) -> None:
         llm = self._llm or build_chat_model(self.settings, supports_thinking=supports_thinking)
-        analyzer = self._analyzer
-        if analyzer is None and self.settings.query_rewrite and self._llm is None:
+        analyzer = None
+        if self.settings.query_rewrite:
             analyzer = build_analyzer(self.settings, supports_thinking=supports_thinking)
         deps = PipelineDeps(
             settings=self.settings,

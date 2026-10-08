@@ -119,7 +119,7 @@ class Settings:
     # auto = set up local FLUX images automatically on macOS with >= 16 GB RAM; on; off
     local_images: str = "auto"
     local_image_port: int = 11435
-    # None = auto: the dedicated image server from scripts/ollama_imagegen.sh, then the main Ollama
+    # None = auto: the app's own image server on LOCAL_IMAGE_PORT, then the main Ollama
     ollama_image_base_url: str | None = None
     cloudflare_account_id: str | None = None
     cloudflare_api_token: str | None = None

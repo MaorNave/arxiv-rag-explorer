@@ -1,9 +1,10 @@
 """Ollama helpers: reachability check, model download and capability detection.
 
-Also a small, optional CLI that downloads everything up front (the app does it on its
+Also a small, optional CLI that downloads the essentials up front (the app does it on its
 first start anyway): the Qwen chat model and the embedding model through Ollama, plus
 the small cross-encoder reranker from Hugging Face. If no Ollama is running, the app's
 own copy is installed into STORAGE_DIR/runtime and used, like `python main.py` does.
+The optional local image model is set up by the app itself, in the background.
 
     python -m rag_app.setup_models                    # LLM_MODEL + EMBED_MODEL from env/.env
     python -m rag_app.setup_models --llm qwen3.5:9b   # pick another Qwen size
@@ -12,6 +13,7 @@ own copy is installed into STORAGE_DIR/runtime and used, like `python main.py` d
 from __future__ import annotations
 
 import argparse
+import signal
 import sys
 from collections.abc import Callable, Iterable
 
@@ -19,6 +21,7 @@ import httpx
 import ollama
 
 from .config import Settings
+from .runtime import RuntimeManager
 
 ProgressCallback = Callable[[str, "float | None", str], None]
 
@@ -78,7 +81,7 @@ def ensure_models(
     return missing
 
 
-def _cli_progress() -> ProgressCallback:
+def cli_progress() -> ProgressCallback:
     last: dict[str, str] = {}
 
     def report(model: str, percent: float | None, status: str) -> None:
@@ -91,6 +94,22 @@ def _cli_progress() -> ProgressCallback:
     return report
 
 
+def connect(settings: Settings, runtime: RuntimeManager, models: list[str], base_url: str | None = None) -> str | None:
+    """Ollama version at base_url for a command-line tool, running the app's own copy there when
+    nothing is (like `python main.py`; stop it with runtime.stop()). None, with a hint, if unreachable."""
+    base_url = base_url or settings.ollama_base_url
+    version = ollama_version(base_url)
+    if version is None and base_url == settings.ollama_base_url and runtime.can_run_main():
+        print("No Ollama running: setting up the app's own copy in", runtime.dir)
+        progress = cli_progress()
+        runtime.start_main(models, lambda pct, text: progress("ollama", pct, text))
+        print()
+        version = ollama_version(base_url)
+    if version is None:
+        print(INSTALL_HINT.format(url=base_url), file=sys.stderr)
+    return version
+
+
 def main(argv: list[str] | None = None) -> int:
     settings = Settings.from_env()
     parser = argparse.ArgumentParser(description="Download the Ollama models used by the RAG app.")
@@ -98,27 +117,23 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--embed", default=settings.embed_model, help=f"embedding model (default: {settings.embed_model})")
     parser.add_argument("--base-url", default=settings.ollama_base_url, help="Ollama server URL")
     parser.add_argument("--no-reranker", action="store_true", help="skip the cross-encoder download")
-    parser.add_argument(
-        "--image", action="store_true",
-        help=f"also pull the local image model ({settings.ollama_image_model}, ~5.7 GB) for illustrations",
-    )
     args = parser.parse_args(argv)
 
-    from .runtime import RuntimeManager
-
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))  # `kill` unwinds too, through the finally below
     runtime = RuntimeManager(settings)
-    version = ollama_version(args.base_url)
-    if version is None and args.base_url == settings.ollama_base_url and runtime.can_run_main():
-        print("No Ollama running: installing the app's own copy into", runtime.dir)
-        runtime.start_main([args.llm, args.embed], lambda pct, text: _cli_progress()("ollama", pct, text))
-        print()
-        version = ollama_version(args.base_url)
+    try:
+        return _setup(args, settings, runtime)
+    finally:
+        runtime.stop()  # an Ollama started by this command never outlives it (errors, Ctrl+C, kill)
+
+
+def _setup(args: argparse.Namespace, settings: Settings, runtime: RuntimeManager) -> int:
+    models = [args.llm, args.embed]
+    version = connect(settings, runtime, models, args.base_url)
     if version is None:
-        print(INSTALL_HINT.format(url=args.base_url), file=sys.stderr)
         return 1
     print(f"Ollama {version} at {args.base_url}")
-    models = [args.llm, args.embed] + ([settings.ollama_image_model] if args.image else [])
-    pulled = ensure_models(args.base_url, models, on_progress=_cli_progress())
+    pulled = ensure_models(args.base_url, models, on_progress=cli_progress())
     if pulled:
         print()
     for model in models:
@@ -130,7 +145,6 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  … reranker {settings.reranker_model} (Hugging Face, ~90 MB on first run)")
         CrossEncoderReranker(settings.reranker_model, settings.models_dir, settings.rerank_max_tokens).load()
         print(f"  ✓ {settings.reranker_model}")
-    runtime.stop()
     print("Models are ready. Start the app with:  python main.py")
     return 0
 

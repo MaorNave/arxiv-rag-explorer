@@ -143,6 +143,46 @@ def test_service_discovers_the_local_image_server(settings, embeddings, monkeypa
     assert service.image_generator.local_url is None
     assert service.image_generator.chain() == ["pollinations"]
 
+    # The regular Ollama has the model too, but 0.32.13 can no longer run it (image generation ended
+    # in 0.32.6): where the app runs its own 0.32.5 image server it is skipped, elsewhere it is tried.
+    servers[settings.ollama_base_url].add("x/flux2-klein:4b")
+    service.ollama_version = "0.32.13"
+    monkeypatch.setattr(service, "_local_images_wanted", lambda: True)
+    asyncio.run(service._refresh_local_image())
+    assert service.image_generator.local_url is None
+    monkeypatch.setattr(service, "_local_images_wanted", lambda: False)  # e.g. Linux: the server decides
+    asyncio.run(service._refresh_local_image())
+    assert service.image_generator.local_url == settings.ollama_base_url
+
+
+def test_failed_ollama_setup_keeps_its_reason_on_screen(settings, embeddings, monkeypatch):
+    import asyncio
+
+    from rag_app import service as service_module
+
+    monkeypatch.setattr(service_module, "ollama_version", lambda url: None)  # no Ollama running
+    service = RAGService(settings, embeddings=embeddings, llm=fake_llm())
+    monkeypatch.setattr(service.runtime, "can_run_main", lambda: True)
+
+    def offline(models, progress):
+        raise RuntimeError("cannot reach github.com")
+
+    monkeypatch.setattr(service.runtime, "start_main", offline)
+
+    async def first_status():
+        waiting = asyncio.create_task(service._wait_for_ollama())  # it keeps waiting for Ollama
+        for _ in range(500):
+            if service.status.snapshot()["state"] == "error":
+                break
+            await asyncio.sleep(0.01)
+        waiting.cancel()
+
+    asyncio.run(first_status())
+    status = service.status.snapshot()
+    assert status["state"] == "error" and status["error"] == "cannot reach github.com"
+    assert "cannot reach github.com" in status["message"]
+    assert "OLLAMA_BASE_URL" not in status["message"]  # not the generic advice that just failed
+
 
 def test_app_is_ready_while_the_reranker_is_still_downloading(settings, embeddings):
     import threading

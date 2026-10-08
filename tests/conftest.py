@@ -20,6 +20,7 @@ from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
 from langchain_core.messages import AIMessage
 
 from rag_app.config import Settings
+from rag_app.embeddings import PrefixedEmbeddings
 
 RECORDS = [
     {"id": "2509.00001v1", "title": "RLBFF: Binary Flexible Feedback for reward models",
@@ -103,5 +104,5 @@ def settings(tmp_path: Path, dataset: Path) -> Settings:
 
 
 @pytest.fixture
-def embeddings() -> HashEmbeddings:
-    return HashEmbeddings()
+def embeddings() -> PrefixedEmbeddings:
+    return PrefixedEmbeddings(HashEmbeddings())

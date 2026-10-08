@@ -2,7 +2,6 @@ import asyncio
 
 import pytest
 
-from rag_app.embeddings import PrefixedEmbeddings
 from rag_app.graph import (
     PipelineDeps,
     anchored_topic,
@@ -70,7 +69,7 @@ def test_image_prompt_has_no_llm_dependency():
 
 @pytest.fixture
 def index(settings, embeddings, dataset):
-    return IndexManager(settings, PrefixedEmbeddings(embeddings, model="fake")).load_or_build(dataset)
+    return IndexManager(settings, embeddings).load_or_build(dataset)
 
 
 class FakeImages:

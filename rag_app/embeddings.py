@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 from langchain_core.embeddings import Embeddings
 from langchain_ollama import OllamaEmbeddings
 
@@ -30,11 +32,10 @@ def default_prefixes(model: str) -> tuple[str, str]:
 class PrefixedEmbeddings(Embeddings):
     """Adds document/query prefixes before delegating to the wrapped embeddings."""
 
-    def __init__(self, inner: Embeddings, doc_prefix: str = "", query_prefix: str = "", model: str = ""):
+    def __init__(self, inner: Embeddings, doc_prefix: str = "", query_prefix: str = ""):
         self.inner = inner
         self.doc_prefix = doc_prefix
         self.query_prefix = query_prefix
-        self.model = model
 
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
         return self.inner.embed_documents([self.doc_prefix + t for t in texts])
@@ -46,20 +47,24 @@ class PrefixedEmbeddings(Embeddings):
         """Embed several queries in a single batched call."""
         return self.inner.embed_documents([self.query_prefix + t for t in texts])
 
-    async def aembed_documents(self, texts: list[str]) -> list[list[float]]:
-        return await self.inner.aembed_documents([self.doc_prefix + t for t in texts])
 
-    async def aembed_query(self, text: str) -> list[float]:
-        return await self.inner.aembed_query(self.query_prefix + text)
+_DURATION_PART = re.compile(r"(\d+(?:\.\d+)?)(ns|us|µs|ms|s|m|h)")
+_DURATION_UNITS = {"ns": 1e-9, "us": 1e-6, "µs": 1e-6, "ms": 1e-3, "s": 1, "m": 60, "h": 3600}
 
 
 def duration_seconds(value: str) -> int:
-    """Convert an Ollama-style duration ("30m", "1h", "90s", "-1") to seconds."""
+    """Convert an Ollama keep-alive ("30m", "1h30m", "90s", "300", "-1") to whole seconds."""
     value = value.strip().lower()
-    units = {"s": 1, "m": 60, "h": 3600}
-    if value and value[-1] in units:
-        return int(float(value[:-1]) * units[value[-1]])
-    return int(float(value))
+    try:
+        return int(float(value))  # plain number of seconds; negative = keep the model loaded
+    except ValueError:
+        pass
+    sign = -1 if value.startswith("-") else 1
+    body = value.lstrip("+-")
+    parts = _DURATION_PART.findall(body)
+    if not parts or "".join(number + unit for number, unit in parts) != body:
+        raise ValueError(f"Invalid duration {value!r} (examples: 30m, 1h30m, 90s, -1)")
+    return sign * int(sum(float(number) * _DURATION_UNITS[unit] for number, unit in parts))
 
 
 def build_embeddings(settings: Settings) -> PrefixedEmbeddings:
@@ -73,4 +78,4 @@ def build_embeddings(settings: Settings) -> PrefixedEmbeddings:
         base_url=settings.ollama_base_url,
         keep_alive=duration_seconds(settings.llm_keep_alive),
     )
-    return PrefixedEmbeddings(inner, doc_prefix, query_prefix, model=settings.embed_model)
+    return PrefixedEmbeddings(inner, doc_prefix, query_prefix)

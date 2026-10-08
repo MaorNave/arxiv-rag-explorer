@@ -6,9 +6,9 @@ import threading
 import time
 from typing import Any
 
-# Lifecycle: starting -> waiting_for_ollama -> pulling_models -> indexing -> ready
-#            (any state may end in "error"; a dataset change moves ready -> indexing)
-STATES = ("starting", "waiting_for_ollama", "pulling_models", "indexing", "ready", "error")
+# Lifecycle: starting -> [waiting_for_ollama | installing_runtime] -> pulling_models -> indexing -> ready
+#            (any state may end in "error"; after a failed Ollama setup the app keeps waiting and moves
+#            on once Ollama is reachable; a dataset change moves ready -> indexing)
 
 
 class StatusTracker:
@@ -29,11 +29,6 @@ class StatusTracker:
 
     def set_state(self, state: str, message: str, *, progress: dict | None = None, error: str | None = None) -> None:
         self.update(state=state, message=message, progress=progress, error=error)
-
-    @property
-    def state(self) -> str:
-        with self._lock:
-            return self._data["state"]
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:

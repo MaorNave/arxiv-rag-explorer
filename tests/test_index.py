@@ -1,6 +1,8 @@
 from dataclasses import replace
 
-from rag_app.embeddings import PrefixedEmbeddings
+import pytest
+
+from rag_app.embeddings import duration_seconds
 from rag_app.index_manager import IndexManager
 from rag_app.keyword_index import build_match_query
 from rag_app.retriever import HybridRetriever
@@ -9,7 +11,7 @@ from .conftest import RECORDS, write_jsonl
 
 
 def make_manager(settings, embeddings):
-    return IndexManager(settings, PrefixedEmbeddings(embeddings, model="fake"))
+    return IndexManager(settings, embeddings)
 
 
 def test_build_then_reuse_without_rebuilding(settings, embeddings, dataset):
@@ -20,11 +22,11 @@ def test_build_then_reuse_without_rebuilding(settings, embeddings, dataset):
     assert index.manifest["chunks"] == 5
     assert index.keywords.count_chunks() == 5
 
-    calls = embeddings.calls
+    calls = embeddings.inner.calls
     # A fresh manager (= app restart) must load the persisted index, not re-embed.
     reloaded = make_manager(settings, embeddings).load_or_build(dataset)
     assert reloaded.manifest["collection"] == index.manifest["collection"]
-    assert embeddings.calls == calls
+    assert embeddings.inner.calls == calls
 
 
 def test_new_dataset_discards_old_index_and_rebuilds(settings, embeddings, dataset):
@@ -92,3 +94,11 @@ def test_rewrite_weights_cannot_outvote_the_question(settings, embeddings, datas
         weights=[1.0, 0.25, 0.25],
     )
     assert results[0].doc_id == "2509.00001v1"
+
+
+def test_keep_alive_durations():
+    # LLM_KEEP_ALIVE takes Ollama's duration strings; the embedding client needs seconds
+    assert duration_seconds("30m") == 1800 and duration_seconds("90") == 90 and duration_seconds("-1") == -1
+    assert duration_seconds("1h30m") == 5400 and duration_seconds("5m0s") == 300 and duration_seconds("1.5h") == 5400
+    with pytest.raises(ValueError):
+        duration_seconds("soon")

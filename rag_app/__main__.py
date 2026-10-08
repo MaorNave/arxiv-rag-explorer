@@ -18,7 +18,7 @@ def configure_logging(level: str) -> None:
         format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
         datefmt="%H:%M:%S",
     )
-    for noisy in ("httpx", "httpcore", "chromadb", "urllib3", "posthog"):
+    for noisy in ("httpx", "httpcore", "chromadb"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
 
