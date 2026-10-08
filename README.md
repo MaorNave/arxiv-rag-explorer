@@ -99,32 +99,6 @@ generated images); the next `python main.py` sets everything up again.
 
 ---
 
-## Assignment checklist
-
-Every requirement of the home assignment, and where it is met. Docker packaging was deliberately left out: the
-project runs natively with one command and is published as a buildable repository.
-
-| Requirement | How it is met |
-|---|---|
-| Load a `.jsonl` of abstracts without assuming it fits in memory | `JsonlAbstractLoader` (a LangChain `BaseLoader`) streams line by line; indexing works in batches of 64; hashing and line counting are streamed too. Only `id`, `title` and `abstract` are kept. |
-| Index locally | Dense vectors in **Chroma** (persistent, cosine HNSW) + BM25 keyword index in **SQLite FTS5**, under `storage/index/`. |
-| Read `DATA_PATH` on startup, build or load the index | The index is fingerprinted (SHA-256 of the file + embedding model + chunking settings). A matching index loads in ~1 s; otherwise it is built. |
-| New dataset → discard the old index and rebuild | A changed fingerprint drops the old index from service, builds a new one and deletes the old vectors and keywords. It works on restart, on a live file change (watcher), from the UI upload, and via `POST /api/reindex`. |
-| Understand the query | LangGraph node `understand_query`: Qwen returns a JSON-schema-constrained plan (search rewrites, keywords, topic). It also translates non-English questions. |
-| Retrieve relevant entries | Weighted Reciprocal Rank Fusion of dense + BM25 lists, then a local cross-encoder reranks 20 candidates down to `top_k`. |
-| Coherent answer grounded in the context | Qwen answers only from the numbered abstracts, cites inline as `[n]`, and says when the context is insufficient instead of inventing papers or facts. |
-| Citations (doc id + title) and retrieved context in the response | `citations: [{doc_id, title, ref, url}]` and `retrieved_context: ["..."]`, exactly as in the spec, plus `sources`, `query_analysis` and `metrics`. |
-| Web UI at `http://127.0.0.1:8080` with input box, answer, citations, retrieved context | Custom UI, also offline (no CDNs): live pipeline steps, streamed answer with clickable citation chips, context cards, raw JSON, history, dataset panel, dark mode, mobile layout. |
-| Bonus: `/answer` and `/stream` endpoints | `POST/GET /answer` (JSON) and `POST/GET /stream` (Server-Sent Events). OpenAPI docs at `/docs`. |
-| Fully on-prem indexing, retrieval and generation | Ollama (Qwen + embeddings), Chroma, SQLite and ONNX Runtime all run locally. Only the optional image generation may call a (free) external API. |
-| Bonus: optional image generation, UI toggle, in the JSON, must not slow the text | "Generate image" switch → `images: [...]` in the JSON. Free providers only: a local Ollama model first, then the free Cloudflare Workers AI and Pollinations APIs. External APIs run as a **parallel LangGraph branch**; the local model runs after the answer. Tests assert that the text is never delayed. |
-| Runs with a single command | `python main.py` (or `DATA_PATH=/path/to/file.jsonl python main.py`). |
-| Works with any `.jsonl` dataset | Field aliases (`text`/`content`/`summary`…, `doc_id`/`paper_id`…), malformed lines and duplicate ids are skipped, and long texts are chunked. A directory or URL also works as `DATA_PATH`. |
-| CPU-only, 4–8 GB RAM | Ollama runs on CPU or GPU, the reranker on CPU, and model size is configurable (see [hardware](#models-and-hardware)). |
-| README incl. image-generation setup | This file, see [Bonus: image generation](#bonus-image-generation). |
-
----
-
 ## Architecture
 
 ### Query pipeline (LangGraph)
