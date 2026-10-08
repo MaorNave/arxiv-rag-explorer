@@ -19,7 +19,6 @@ everything it needs, Ollama included.
 
 - [Quick start](#quick-start)
 - [Start, stop and restart](#start-stop-and-restart)
-- [Assignment checklist](#assignment-checklist)
 - [Architecture](#architecture)
 - [Using another dataset](#using-another-dataset)
 - [API](#api)
